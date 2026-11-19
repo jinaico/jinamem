@@ -193,17 +193,46 @@ function setupCodex(): Result {
     log("MCP server in .codex/config.toml");
   }
 
-  // Codex has no failure event; failed commands also arrive as PostToolUse
-  const cfg = readJson(hooksPath);
-  const hooks = (cfg.hooks ??= {}) as Json;
-  if (addHookGroup(hooks, "PostToolUse", {
-    matcher: "Bash|apply_patch|Edit|Write",
-    hooks: [{ type: "command", command: hookCmd("codex"), timeout: 30 }],
-  })) log("PostToolUse hook in .codex/hooks.json");
-  writeJson(hooksPath, cfg);
+  // Codex has no failure event; failed commands also arrive as PostToolUse.
+  // Codex warns when one config layer defines hooks both inline in
+  // config.toml and in hooks.json, so follow whichever format the project
+  // already uses.
+  const MATCHER = "Bash|apply_patch|Edit|Write";
+  const tomlNow = readFileSync(tomlPath, "utf8");
+  const inlineHooks = /^\s*\[\[?hooks[.\]]/m.test(tomlNow);
+  const inlineArrayForm = /^\s*PostToolUse\s*=/m.test(tomlNow);   // [hooks] PostToolUse = [...]
+  const jsonCfg = readJson(hooksPath);
+  const inJson = ((jsonCfg.hooks as Json | undefined)?.PostToolUse as Json[] | undefined)
+    ?.some(g => (g.hooks as Json[] | undefined)?.some(isJinamemHook)) ?? false;
+  const inToml = /jinamem-hook/.test(tomlNow);
+
+  if (inJson || inToml) {
+    // already configured in one of the two places
+  } else if (inlineHooks && !inlineArrayForm) {
+    const q = (v: string) => JSON.stringify(v);
+    const block = [
+      "[[hooks.PostToolUse]]",
+      `matcher = ${q(MATCHER)}`,
+      "",
+      "[[hooks.PostToolUse.hooks]]",
+      'type = "command"',
+      `command = ${q(hookCmd("codex"))}`,
+      "timeout = 30",
+    ].join("\n");
+    writeFileSync(tomlPath, tomlNow + (tomlNow.endsWith("\n") ? "" : "\n") + "\n" + block + "\n");
+    log("PostToolUse hook in .codex/config.toml (your hooks live there)");
+  } else {
+    const hooks = (jsonCfg.hooks ??= {}) as Json;
+    addHookGroup(hooks, "PostToolUse", {
+      matcher: MATCHER,
+      hooks: [{ type: "command", command: hookCmd("codex"), timeout: 30 }],
+    });
+    writeJson(hooksPath, jsonCfg);
+    log("PostToolUse hook in .codex/hooks.json");
+  }
 
   return {
-    files: [".codex/config.toml", ".codex/hooks.json"],
+    files: [".codex/config.toml"],
     next: "trust this project in Codex, then run /hooks once to approve jinamem's hook (Codex asks before running project hooks)",
   };
 }
