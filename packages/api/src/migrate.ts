@@ -12,7 +12,17 @@ if (!DATABASE_URL) {
   process.exit(1);
 }
 
-const sql = postgres(DATABASE_URL);
+const sql = postgres(DATABASE_URL, { onnotice: () => {} });
+
+// pgvector is optional: with it, recall is semantic + keyword; without it,
+// keyword only. Create the extension first so the column type exists.
+let vectors = false;
+try {
+  await sql`CREATE EXTENSION IF NOT EXISTS vector`;
+  vectors = true;
+} catch {
+  console.warn("pgvector not available — semantic search will fall back to keyword only.");
+}
 
 await sql`
   CREATE TABLE IF NOT EXISTS users (
@@ -33,7 +43,6 @@ await sql`
     content     TEXT NOT NULL,
     metadata    JSONB NOT NULL DEFAULT '{}',
     pinned      BOOLEAN NOT NULL DEFAULT FALSE,
-    embedding   vector(384),
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     expires_at  TIMESTAMPTZ
   )
@@ -70,13 +79,14 @@ await sql`CREATE INDEX IF NOT EXISTS idx_memories_pinned ON memories (user_id, p
 await sql`CREATE INDEX IF NOT EXISTS idx_attempts_session ON attempts (session_id)`;
 await sql`CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions (user_id, project, started_at DESC)`;
 
-// Try to create pgvector extension (requires superuser on some hosts)
-try {
-  await sql`CREATE EXTENSION IF NOT EXISTS vector`;
-  await sql`CREATE INDEX IF NOT EXISTS idx_memories_embedding ON memories USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)`;
-  console.log("pgvector extension and index created.");
-} catch {
-  console.warn("pgvector not available — semantic search will fall back to keyword only.");
+if (vectors) {
+  await sql`ALTER TABLE memories ADD COLUMN IF NOT EXISTS embedding vector(384)`;
+  try {
+    await sql`CREATE INDEX IF NOT EXISTS idx_memories_embedding ON memories USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)`;
+    console.log("pgvector enabled: embedding column and index ready.");
+  } catch (err) {
+    console.warn("pgvector index not created:", (err as Error).message);
+  }
 }
 
 console.log("Migration complete.");

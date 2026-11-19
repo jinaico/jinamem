@@ -114,16 +114,22 @@ app.post("/auth/register", async (req, reply) => {
   `;
 
   const user = rows[0]!;
+  const apiUrl = process.env.PUBLIC_URL ?? "https://jinamem.dev";
   reply.status(201).send({
     token: user.token,
     userId: user.id,
     plan: user.plan,
+    // Claude Code: one command saves the token where the MCP server, the
+    // hook and jinamem-watch can all read it (~/.jinamem/config.json).
+    setupCommand: `npx -y -p @jinamem/mcp jinamem-setup --token ${user.token}` +
+      (apiUrl === "https://jinamem.dev" ? "" : ` --api-url ${apiUrl}`),
+    // Other MCP hosts (no hooks): paste into the MCP config
     mcpConfig: {
       mcpServers: {
         jinamem: {
           command: "npx",
-          args: ["@jinamem/mcp"],
-          env: { JINAMEM_TOKEN: user.token, JINAMEM_API_URL: process.env.PUBLIC_URL ?? "https://jinamem.dev" },
+          args: ["-y", "-p", "@jinamem/mcp", "jinamem-mcp"],
+          env: { JINAMEM_TOKEN: user.token, JINAMEM_API_URL: apiUrl },
         },
       },
     },

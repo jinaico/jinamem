@@ -12,16 +12,19 @@ import type {
 export class CloudStore implements JinamemStore {
   private baseUrl: string;
   private token: string;
+  private timeoutMs: number;
 
-  constructor(token: string, apiUrl = "https://jinamem.dev") {
+  constructor(token: string, apiUrl = "https://jinamem.dev", timeoutMs = 15_000) {
     this.token = token;
     this.baseUrl = apiUrl.replace(/\/$/, "");
+    this.timeoutMs = timeoutMs;
   }
 
   private async fetch<T>(path: string, opts: RequestInit = {}): Promise<T> {
     const url = `${this.baseUrl}${path}`;
     const res = await fetch(url, {
       ...opts,
+      signal: AbortSignal.timeout(this.timeoutMs),
       headers: {
         "Authorization": `Bearer ${this.token}`,
         "Content-Type": "application/json",
@@ -119,7 +122,16 @@ export class CloudStore implements JinamemStore {
   }
 
   async getBriefing(userId: string, project: string): Promise<Briefing> {
-    return this.fetch<Briefing>(`/v1/briefing?project=${encodeURIComponent(project)}`);
+    // Dates arrive as ISO strings over JSON — revive them to match the interface
+    const raw = await this.fetch<Omit<Briefing, "lastSession"> & {
+      lastSession?: { task?: string; endedAt: string; status: NonNullable<Briefing["lastSession"]>["status"] };
+    }>(`/v1/briefing?project=${encodeURIComponent(project)}`);
+    return {
+      ...raw,
+      lastSession: raw.lastSession
+        ? { ...raw.lastSession, endedAt: new Date(raw.lastSession.endedAt) }
+        : undefined,
+    };
   }
 
   async getSessionAttempts(sessionId: string): Promise<Attempt[]> {

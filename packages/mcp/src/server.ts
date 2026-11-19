@@ -2,39 +2,28 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import {
-  SqliteStore,
-  CloudStore,
+  createStore,
   getSummaryClient,
   buildSummaryPrompt,
   parseSummaryOutput,
   type JinamemStore,
 } from "@jinamem/core";
-import { mkdirSync } from "fs";
-import { resolve } from "path";
-import { homedir } from "os";
 import { randomUUID } from "crypto";
 
 // ─── Bootstrap ───────────────────────────────────────────────────────────────
 
-const USER_ID   = process.env.JINAMEM_USER_ID ?? "local";
-const DB_PATH   = process.env.JINAMEM_DB_PATH;
-const TOKEN     = process.env.JINAMEM_TOKEN;
-const API_URL   = process.env.JINAMEM_API_URL ?? "https://jinamem.dev";
+const USER_ID = process.env.JINAMEM_USER_ID ?? "local";
 
-// Auto-select store: cloud if JINAMEM_TOKEN is set, local SQLite otherwise
-let store: JinamemStore;
-if (TOKEN) {
-  store = new CloudStore(TOKEN, API_URL);
-  console.error(`[jinamem] cloud mode · ${API_URL}`);
-} else {
-  const defaultDir = resolve(homedir(), ".jinamem");
-  mkdirSync(defaultDir, { recursive: true });
-  store = new SqliteStore(DB_PATH);
-  console.error(`[jinamem] local mode · ${DB_PATH ?? "~/.jinamem/memory.db"}`);
-}
+// Cloud if a token is set (JINAMEM_TOKEN or ~/.jinamem/config.json), local SQLite otherwise.
+// Shared with jinamem-hook and jinamem-watch so all three write to the same place.
+const { store, config } = createStore();
+console.error(config.mode === "cloud"
+  ? `[jinamem] cloud mode · ${config.apiUrl}`
+  : `[jinamem] local mode · ${config.dbPath}`);
 
-// One session ID per process — one MCP server process = one agent session
-const SESSION_ID = randomUUID();
+// One session per process — one MCP server process = one agent session.
+// Replaced by the store's own session ID once the session row exists.
+let SESSION_ID: string = randomUUID();
 
 // Derive project from cwd or env override
 function getProject(): string {
@@ -46,8 +35,14 @@ function getProject(): string {
 let sessionStarted = false;
 async function ensureSession() {
   if (sessionStarted) return;
-  sessionStarted = true;
-  await store.startSession(USER_ID, getProject());
+  try {
+    const session = await store.startSession(USER_ID, getProject());
+    SESSION_ID = session.id;   // attempts and endSession must use the stored ID
+    sessionStarted = true;
+  } catch (err) {
+    // e.g. cloud unreachable at startup — keep serving, retry on next tool call
+    console.error("[jinamem] could not start session (will retry):", (err as Error).message);
+  }
 }
 
 // ─── MCP Server ──────────────────────────────────────────────────────────────
@@ -317,7 +312,10 @@ server.tool(
 // Auto-summarises the session so next briefing is accurate.
 // ═══════════════════════════════════════════════════════════════════════════
 
+let shuttingDown = false;
 async function shutdown(signal: string) {
+  if (shuttingDown) return;   // stdin close and SIGTERM often arrive together
+  shuttingDown = true;
   console.error(`[jinamem] ${signal} received — saving session...`);
 
   try {
@@ -356,7 +354,7 @@ async function shutdown(signal: string) {
     }
 
     // 2. End the session with a timestamp
-    await store.endSession(SESSION_ID);
+    if (sessionStarted) await store.endSession(SESSION_ID);
     console.error("[jinamem] session saved.");
 
   } catch (err) {
@@ -368,6 +366,11 @@ async function shutdown(signal: string) {
 }
 
 process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGHUP",  () => shutdown("SIGHUP"));
+// MCP clients usually end a stdio server by closing its stdin, not by
+// signalling it — without this the session is never ended or summarized.
+process.stdin.on("end",   () => shutdown("stdin closed"));
+process.stdin.on("close", () => shutdown("stdin closed"));
 process.on("SIGINT",  () => shutdown("SIGINT"));
 
 // Also handle uncaught errors gracefully — save session before crashing

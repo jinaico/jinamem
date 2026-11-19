@@ -7,15 +7,44 @@
  *   # or, after `npm install -g @jinamem/mcp`:
  *   jinamem-setup
  *
+ *   # hosted version (jinamem.dev) or a self-hosted cloud API:
+ *   jinamem-setup --token am_live_... [--api-url https://your-host]
+ *   jinamem-setup --local          # forget the saved token, back to SQLite
+ *
  * What it does:
  *   1. Adds the jinamem MCP server to .mcp.json (Claude Code's project MCP config)
  *   2. Approves it and adds PostToolUse + PostToolUseFailure hooks in
  *      .claude/settings.json
- *   3. Prints the next step (restart Claude Code)
+ *   3. With --token, saves it to ~/.jinamem/config.json so the MCP server,
+ *      the hook and jinamem-watch all use the cloud (hooks don't see env
+ *      vars from .mcp.json, so the token can't live there)
+ *   4. Prints the next step (restart Claude Code)
  */
 
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "fs";
 import { join, delimiter } from "path";
+import { writeConfig, resolveStoreConfig, configPath } from "@jinamem/core";
+
+// ─── Args ─────────────────────────────────────────────────────────────────────
+
+const argv = process.argv.slice(2);
+function arg(name: string): string | undefined {
+  const i = argv.indexOf(name);
+  if (i === -1) return undefined;
+  const v = argv[i + 1];
+  if (!v || v.startsWith("--")) {
+    console.error(`❌ ${name} needs a value`);
+    process.exit(1);
+  }
+  return v;
+}
+const tokenArg = arg("--token");
+const apiUrlArg = arg("--api-url");
+const goLocal = argv.includes("--local");
+if (tokenArg && goLocal) {
+  console.error("❌ Use either --token or --local, not both");
+  process.exit(1);
+}
 
 const cwd = process.cwd();
 const claudeDir = join(cwd, ".claude");
@@ -111,6 +140,17 @@ function main() {
   console.log(`Project: ${cwd}`);
   console.log(`Mode:    ${globalInstall ? "global install" : "npx (run `npm i -g @jinamem/mcp` for faster hooks)"}\n`);
 
+  if (tokenArg) {
+    const path = writeConfig({ token: tokenArg, apiUrl: apiUrlArg });
+    console.log(`  ✓ Saved cloud token to ${path}`);
+  } else if (apiUrlArg) {
+    writeConfig({ apiUrl: apiUrlArg });
+    console.log(`  ✓ Saved API URL to ${configPath()}`);
+  } else if (goLocal) {
+    writeConfig({ token: "", apiUrl: "" });
+    console.log("  ✓ Removed saved cloud token — using local SQLite");
+  }
+
   const mcp = readJson(mcpJsonPath);
   const settings = readJson(settingsPath);
 
@@ -121,7 +161,14 @@ function main() {
   writeFileSync(mcpJsonPath, JSON.stringify(mcp, null, 2) + "\n");
   writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + "\n");
 
+  const store = resolveStoreConfig();
   console.log(`\n✅ Done! Wrote .mcp.json and .claude/settings.json`);
+  console.log(store.mode === "cloud"
+    ? `Storage: cloud · ${store.apiUrl}`
+    : `Storage: local · ${store.dbPath}`);
+  if (goLocal && process.env.JINAMEM_TOKEN) {
+    console.log("⚠️  JINAMEM_TOKEN is still set in your environment and takes precedence.");
+  }
   console.log("\nNext: restart Claude Code in this project.");
   console.log("jinamem will start capturing your session automatically.\n");
 }

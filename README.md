@@ -234,6 +234,10 @@ JINAMEM_PROJECT=my-project jinamem-mcp
 | `JINAMEM_USER_ID` | `"local"` | User ID (for multi-user setups) |
 | `JINAMEM_TOKEN` | — | Cloud token (jinamem.dev hosted version) |
 | `JINAMEM_API_URL` | `https://jinamem.dev` | Cloud API URL (for self-hosted cloud) |
+| `JINAMEM_HOME` | `~/.jinamem` | Directory for the local DB, `config.json` and the offline outbox |
+| `JINAMEM_HOOK_TIMEOUT_MS` | `3000` | Max time the hook waits on the cloud API before queueing |
+
+The token and API URL can also be saved with `jinamem-setup --token ... [--api-url ...]`; environment variables take precedence over the saved config.
 
 ---
 
@@ -262,7 +266,17 @@ Don't want to manage infrastructure? [jinamem.dev](https://jinamem.dev) is the h
 
 $20/month · 14-day free trial · no credit card required
 
-Add your token to the config:
+Point jinamem at the cloud with your token:
+
+```bash
+jinamem-setup --token am_live_your_token_here
+```
+
+This saves the token to `~/.jinamem/config.json` (readable only by you), where the MCP server, the capture hook and `jinamem-watch` all pick it up, so everything they capture goes to the cloud. Run `jinamem-setup --local` to switch back to local SQLite.
+
+If the API is unreachable, the hook queues captures in `~/.jinamem/outbox.jsonl` and sends them on a later run. It never blocks your agent for more than ~3 seconds.
+
+**Other MCP hosts (no hooks):** you can instead pass the token as env on the server:
 
 ```json
 {
@@ -270,16 +284,13 @@ Add your token to the config:
     "jinamem": {
       "command": "npx",
       "args": ["-y", "-p", "@jinamem/mcp", "jinamem-mcp"],
-      "env": {
-        "JINAMEM_TOKEN": "am_live_your_token_here",
-        "JINAMEM_API_URL": "https://jinamem.dev"
-      }
+      "env": { "JINAMEM_TOKEN": "am_live_your_token_here" }
     }
   }
 }
 ```
 
-The MCP server auto-detects the token at startup and switches to cloud mode. Local SQLite mode is used when no token is set — no config change needed.
+With no token anywhere, jinamem runs in local SQLite mode with no config change needed.
 
 ---
 
@@ -306,8 +317,14 @@ docker compose -f docker-compose.cloud.yml up -d
 curl -X POST http://localhost:3001/auth/register \
   -H "Content-Type: application/json" \
   -d '{"email":"you@example.com"}'
-# → returns {"token": "am_live_..."}
+# → returns {"token": "am_live_...", "setupCommand": "npx -y -p @jinamem/mcp jinamem-setup --token am_live_... --api-url ..."}
+
+# 6. Connect a project: run the returned setupCommand in your project directory
 ```
+
+Set `PUBLIC_URL` in `.env` to the address clients use to reach the API; it goes into the returned `setupCommand`.
+
+pgvector is optional. With it, recall is semantic plus keyword; without it, recall is keyword only, and the migration handles both.
 
 The dashboard is served at `http://localhost:3001` — sign in with your token to browse memory.
 

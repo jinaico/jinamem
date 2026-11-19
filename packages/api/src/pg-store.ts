@@ -11,8 +11,22 @@ import type {
 } from "@jinamem/core";
 import { getEmbedder } from "@jinamem/core";
 
+// Whether memories.embedding exists (only created when pgvector is installed).
+// Checked once per process; without it, recall is keyword-only.
+let hasVectorColumn: Promise<boolean> | null = null;
+
 export class PgStore implements JinamemStore {
   constructor(private sql: postgres.Sql) {}
+
+  private vectorsEnabled(): Promise<boolean> {
+    if (!hasVectorColumn) {
+      hasVectorColumn = this.sql<{ n: number }[]>`
+        SELECT count(*)::int AS n FROM information_schema.columns
+        WHERE table_name = 'memories' AND column_name = 'embedding'
+      `.then(r => r[0]!.n > 0).catch(() => false);
+    }
+    return hasVectorColumn;
+  }
 
   async remember(userId: string, project: string, note: string, pin = false): Promise<Memory> {
     const id = randomUUID();
@@ -20,23 +34,30 @@ export class PgStore implements JinamemStore {
 
     // Try to embed
     let embeddingStr: string | null = null;
+    const vectors = await this.vectorsEnabled();
     try {
-      const embedder = await getEmbedder();
+      const embedder = vectors ? await getEmbedder() : null;
       if (embedder) {
         const vec = await embedder.embed(note);
         embeddingStr = `[${vec.join(",")}]`;
       }
     } catch { /* non-fatal */ }
 
-    const rows = await this.sql<{ id: string; created_at: Date; expires_at: Date | null }[]>`
-      INSERT INTO memories (id, user_id, project, kind, content, pinned, embedding, created_at, expires_at)
-      VALUES (
-        ${id}, ${userId}, ${project}, 'fact', ${note}, ${pin},
-        ${embeddingStr ? this.sql`${embeddingStr}::vector` : this.sql`NULL`},
-        NOW(), ${expiresAt}
-      )
-      RETURNING id, created_at, expires_at
-    `;
+    const rows = vectors
+      ? await this.sql<{ id: string; created_at: Date; expires_at: Date | null }[]>`
+          INSERT INTO memories (id, user_id, project, kind, content, pinned, embedding, created_at, expires_at)
+          VALUES (
+            ${id}, ${userId}, ${project}, 'fact', ${note}, ${pin},
+            ${embeddingStr ? this.sql`${embeddingStr}::vector` : this.sql`NULL`},
+            NOW(), ${expiresAt}
+          )
+          RETURNING id, created_at, expires_at
+        `
+      : await this.sql<{ id: string; created_at: Date; expires_at: Date | null }[]>`
+          INSERT INTO memories (id, user_id, project, kind, content, pinned, created_at, expires_at)
+          VALUES (${id}, ${userId}, ${project}, 'fact', ${note}, ${pin}, NOW(), ${expiresAt})
+          RETURNING id, created_at, expires_at
+        `;
 
     const row = rows[0]!;
     return {
@@ -74,7 +95,7 @@ export class PgStore implements JinamemStore {
 
     // Try semantic search
     try {
-      const embedder = await getEmbedder();
+      const embedder = (await this.vectorsEnabled()) ? await getEmbedder() : null;
       if (embedder) {
         const vec = await embedder.embed(query);
         const vecStr = `[${vec.join(",")}]`;

@@ -18,10 +18,11 @@
  * }
  */
 
-import { SqliteStore } from "@jinamem/core";
-import { mkdirSync } from "fs";
+import { createStore, jinamemDir, type JinamemStore } from "@jinamem/core";
+import {
+  appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync,
+} from "fs";
 import { resolve } from "path";
-import { homedir } from "os";
 import { randomUUID } from "crypto";
 
 // ─── Claude Code Hook Event Schema ───────────────────────────────────────────
@@ -156,6 +157,60 @@ const SKIP_TOOLS = new Set([
   "TodoRead", "TodoWrite",
 ]);
 
+// ─── Cloud delivery + offline outbox ──────────────────────────────────────────
+
+// Hooks block Claude Code until they exit, so keep network calls short.
+const CLOUD_TIMEOUT_MS = Number(process.env.JINAMEM_HOOK_TIMEOUT_MS ?? 3000);
+const OUTBOX_MAX = 500;            // oldest entries are dropped beyond this
+const FLUSH_PER_RUN = 25;          // bound the extra latency of a single hook run
+
+interface QueuedAttempt {
+  userId: string; project: string; sessionId: string;
+  action: string; result: string; success: boolean;
+}
+
+const outboxPath = () => resolve(jinamemDir(), "outbox.jsonl");
+
+function sendAttempt(store: JinamemStore, a: QueuedAttempt) {
+  return store.logAttempt(a.userId, a.project, a.sessionId, a.action, a.result, a.success);
+}
+
+function queue(...entries: QueuedAttempt[]) {
+  if (entries.length === 0) return;
+  mkdirSync(jinamemDir(), { recursive: true });
+  appendFileSync(outboxPath(), entries.map(e => JSON.stringify(e)).join("\n") + "\n");
+  // Cap the file so a long outage can't grow it without bound
+  const lines = readFileSync(outboxPath(), "utf8").split("\n").filter(Boolean);
+  if (lines.length > OUTBOX_MAX) {
+    const tmp = `${outboxPath()}.${process.pid}.trim`;
+    appendFileSync(tmp, lines.slice(-OUTBOX_MAX).join("\n") + "\n");
+    renameSync(tmp, outboxPath());
+  }
+}
+
+async function flushOutbox(store: JinamemStore) {
+  const path = outboxPath();
+  if (!existsSync(path)) return;
+
+  // Claim the file atomically — parallel tool calls run parallel hooks,
+  // and only one of them should send each queued entry.
+  const claimed = `${path}.${process.pid}.${randomUUID()}`;
+  try { renameSync(path, claimed); } catch { return; }
+
+  const entries = readFileSync(claimed, "utf8").split("\n").filter(Boolean)
+    .map(l => { try { return JSON.parse(l) as QueuedAttempt; } catch { return null; } })
+    .filter((e): e is QueuedAttempt => e !== null);
+  unlinkSync(claimed);
+
+  let i = 0;
+  try {
+    for (; i < entries.length && i < FLUSH_PER_RUN; i++) await sendAttempt(store, entries[i]);
+  } catch {
+    // Still offline — keep everything not yet sent
+  }
+  queue(...entries.slice(i));
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -206,14 +261,23 @@ async function main() {
   const isBash = event.tool_name === "Bash";
   if (!isBash && success) process.exit(0);
 
-  // Open store
-  const dbDir = resolve(homedir(), ".jinamem");
-  mkdirSync(dbDir, { recursive: true });
-
-  const store = new SqliteStore(process.env.JINAMEM_DB_PATH);
+  const entry: QueuedAttempt = { userId, project, sessionId, action, result, success };
+  const { store, config } = createStore({ timeoutMs: CLOUD_TIMEOUT_MS });
 
   try {
-    await store.logAttempt(userId, project, sessionId, action, result, success);
+    if (config.mode === "cloud") {
+      // Never lose a capture to a network blip: queue it locally and retry
+      // on the next hook run.
+      await flushOutbox(store);
+      try {
+        await sendAttempt(store, entry);
+      } catch (err) {
+        queue(entry);
+        console.error("[jinamem-hook] cloud unreachable, queued:", (err as Error).message);
+      }
+    } else {
+      await sendAttempt(store, entry);
+    }
   } finally {
     await store.close();
   }
