@@ -4,8 +4,7 @@
   "version": "0.0.1",
   "description": "Open-source MCP memory server for AI agents",
   "workspaces": [
-    "packages/*",
-    "apps/*"
+    "packages/*"
   ],
   "scripts": {
     "build": "npm run build --workspaces --if-present",
@@ -18,9 +17,6 @@
     "typescript": "^5.3.3"
   },
   "engines": {
-    "node": ">=18.0.0"
-  },
-  "dependencies": {
-    "better-sqlite3": "^13.2.0"
+    "node": ">=20"
   }
 }

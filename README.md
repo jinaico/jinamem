@@ -34,32 +34,44 @@ Jinamem gives your agent a memory layer that persists across sessions, so it pic
 
 ## Quickstart — Claude Code (30 seconds)
 
+Requires Node.js 20 or later.
+
 ```bash
-# In your project directory:
-npx jinamem-setup
+# Recommended: install once, globally (the hook runs after every tool call, so this keeps it fast)
+npm install -g @jinamem/mcp
+
+# Then, in your project directory:
+jinamem-setup
+```
+
+No global install? This works too (slightly slower hooks):
+
+```bash
+npx -y -p @jinamem/mcp jinamem-setup
 ```
 
 That's it. Restart Claude Code and jinamem starts capturing your session automatically.
 
 What `jinamem-setup` does:
-- Adds the MCP server to `.claude/settings.json`  
-- Adds a PostToolUse hook so every Bash/Edit/Write command is logged automatically  
+- Adds the MCP server to `.mcp.json` and approves it in `.claude/settings.json`
+- Adds `PostToolUse` and `PostToolUseFailure` hooks so every Bash/Edit/Write call — including the ones that fail — is logged automatically
+- Safe to re-run; it never duplicates entries
 - No manual tool calls needed — capture is automatic
 
 ---
 
 ## How automatic capture works
 
-jinamem ships a **PostToolUse hook** that Claude Code fires after every tool call:
+jinamem ships a hook that Claude Code fires after every tool call — `PostToolUse` when it succeeds, `PostToolUseFailure` when it fails:
 
 ```
 Agent runs: Bash("npm test")
               ↓
-Claude Code fires: jinamem-hook (stdin: tool name + output)
+Claude Code fires: jinamem-hook (stdin: tool name + result or error)
               ↓
-jinamem detects: 3 test failures → logs as dead end
+jinamem detects: exit code 1 / "3 tests failed" → logs as dead end
               ↓
-Next session briefing: "🚫 npm test failed: 3 tests failing"
+Next session briefing: "🚫 Bash: npm test: error: Exit code 1 · 3 tests failed"
 ```
 
 You don't have to tell the agent to log anything. The hook does it.
@@ -108,15 +120,17 @@ Without a key, jinamem still works — agents use `remember()` manually and the 
 
 Run `jinamem-watch` alongside your app and it captures errors, crashes, and warnings into memory automatically — even when no agent is active. Next time you open Claude Code, your briefing already knows what broke.
 
+Run it from your project directory so captures land in the same project your agent's briefing reads. (Or set the same `JINAMEM_PROJECT` for both the watcher and the MCP server.)
+
 **Tail a log file:**
 ```bash
-jinamem-watch --follow /var/log/myapp.log --project myapp
+jinamem-watch --follow /var/log/myapp.log
 ```
 
 **Wrap a process (output passes through, errors are captured):**
 ```bash
-jinamem-watch --pipe "npm run dev" --project myapp
-jinamem-watch --pipe "node server.js" --project myapp
+jinamem-watch --pipe "npm run dev"
+jinamem-watch --pipe "node server.js"
 ```
 
 **Filter level** (default: `warn`):
@@ -133,9 +147,10 @@ Description=jinamem log watcher for myapp
 After=network.target
 
 [Service]
-ExecStart=jinamem-watch --follow /var/log/myapp.log --project myapp --level error
+ExecStart=jinamem-watch --follow /var/log/myapp.log --level error
 Restart=always
 Environment=JINAMEM_DB_PATH=/home/user/.jinamem/memory.db
+Environment=JINAMEM_PROJECT=/home/user/myapp
 
 [Install]
 WantedBy=multi-user.target
@@ -159,18 +174,22 @@ Add to your MCP config:
   "mcpServers": {
     "jinamem": {
       "command": "npx",
-      "args": ["@jinamem/mcp"]
+      "args": ["-y", "-p", "@jinamem/mcp", "jinamem-mcp"]
     }
   }
 }
 ```
 
-For hosts that support hooks, add to `.claude/settings.json` (or equivalent):
+For hosts that support Claude Code–style hooks, add to `.claude/settings.json` (or equivalent). Register both events — `PostToolUse` only fires for successful calls:
 
 ```json
 {
   "hooks": {
     "PostToolUse": [{
+      "matcher": "Bash|Edit|MultiEdit|Write",
+      "hooks": [{ "type": "command", "command": "jinamem-hook" }]
+    }],
+    "PostToolUseFailure": [{
       "matcher": "Bash|Edit|MultiEdit|Write",
       "hooks": [{ "type": "command", "command": "jinamem-hook" }]
     }]
@@ -195,21 +214,13 @@ Jinamem stores everything locally by default — no account needed.
 ```bash
 # Data lives at ~/.jinamem/memory.db (SQLite)
 # Override with:
-JINAMEM_DB_PATH=/path/to/memory.db npx @jinamem/mcp
+JINAMEM_DB_PATH=/path/to/memory.db jinamem-mcp
 ```
 
-**Docker**
+**Custom project name** (defaults to the last two parts of the working directory, e.g. `code-myapp`)
 
 ```bash
-docker run -v ~/.jinamem:/data \
-  -e JINAMEM_DB_PATH=/data/memory.db \
-  ghcr.io/jinamem/mcp:latest
-```
-
-**Custom project name** (defaults to current directory name)
-
-```bash
-JINAMEM_PROJECT=my-project npx @jinamem/mcp
+JINAMEM_PROJECT=my-project jinamem-mcp
 ```
 
 ---
@@ -219,9 +230,10 @@ JINAMEM_PROJECT=my-project npx @jinamem/mcp
 | Env var | Default | Description |
 |---------|---------|-------------|
 | `JINAMEM_DB_PATH` | `~/.jinamem/memory.db` | SQLite database path |
-| `JINAMEM_PROJECT` | Current directory name | Project namespace |
+| `JINAMEM_PROJECT` | Working directory (`parent-dir`) | Project namespace — must match across the MCP server, hook and watcher |
 | `JINAMEM_USER_ID` | `"local"` | User ID (for multi-user setups) |
 | `JINAMEM_TOKEN` | — | Cloud token (jinamem.dev hosted version) |
+| `JINAMEM_API_URL` | `https://jinamem.dev` | Cloud API URL (for self-hosted cloud) |
 
 ---
 
@@ -233,11 +245,11 @@ packages/
               types.ts, sqlite-store.ts, embedder.ts, similarity.ts, summarizer.ts
   mcp/      — MCP server + CLI tools
               server.ts    — 4 MCP tools + briefing resource + prompt injection
-              hook.ts      — PostToolUse hook (jinamem-hook binary)
+              hook.ts      — PostToolUse/PostToolUseFailure hook (jinamem-hook binary)
               setup.ts     — One-command setup (jinamem-setup binary)
               watch.ts     — Sidecar log watcher (jinamem-watch binary)
-apps/
-  dashboard/  — Web UI (coming soon)
+  api/        — Cloud API server (Postgres + pgvector)
+  dashboard/  — Web UI for browsing memory
 ```
 
 The `JinamemStore` interface in `@jinamem/core` is designed to be implemented for any backend — SQLite for local use, Postgres for the hosted cloud version, or your own store.
@@ -257,7 +269,7 @@ Add your token to the config:
   "mcpServers": {
     "jinamem": {
       "command": "npx",
-      "args": ["@jinamem/mcp"],
+      "args": ["-y", "-p", "@jinamem/mcp", "jinamem-mcp"],
       "env": {
         "JINAMEM_TOKEN": "am_live_your_token_here",
         "JINAMEM_API_URL": "https://jinamem.dev"
@@ -277,7 +289,7 @@ The API server (`packages/api`) + dashboard (`packages/dashboard`) can be deploy
 
 ```bash
 # 1. Clone the repo
-git clone https://github.com/siddharthjinagouda/jinamem
+git clone https://github.com/jinaico/jinamem
 cd jinamem
 
 # 2. Build the dashboard
@@ -335,7 +347,7 @@ The dashboard is served at `http://localhost:3001` — sign in with your token t
 
 ## Contributing
 
-PRs welcome. See [CONTRIBUTING.md](./CONTRIBUTING.md).
+PRs and issues welcome at [github.com/jinaico/jinamem](https://github.com/jinaico/jinamem/issues).
 
 ## License
 

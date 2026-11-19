@@ -98,8 +98,9 @@ export class PgStore implements JinamemStore {
         const merged = Array.from(all).map(content => {
           const kr = keywordRanks.has(content) ? 1 / (60 + keywordRanks.get(content)!) : 0;
           const sr = semanticRanks.has(content) ? 1 / (60 + semanticRanks.get(content)!) : 0;
-          const row = keywordScored.find(r => r.content === content) ?? semanticRows.find(r => r.content === content)!;
-          return { content, createdAt: row.created_at, score: kr + sr };
+          const kw = keywordScored.find(r => r.content === content);
+          const createdAt = kw ? kw.createdAt : semanticRows.find(r => r.content === content)!.created_at;
+          return { content, createdAt, score: kr + sr };
         }).sort((a, b) => b.score - a.score).slice(0, limit);
 
         return merged.map(r => ({
