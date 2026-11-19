@@ -42,6 +42,8 @@ export interface Briefing {
   };
   pinnedFacts: string[];
   deadEnds: string[];
+  /** Dead ends that later succeeded, with what fixed them (newest first). */
+  fixed?: string[];
   openTasks: string[];
   tokenEstimate: number;
 }

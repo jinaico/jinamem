@@ -18,6 +18,9 @@ Last session: "fix auth middleware" — completed (8h ago)
 🚫 Don't retry  
 • Patching verifyToken directly (causes TypeError)
 
+✅ Fixed
+• npm test: "Cannot find module 'express'" — fixed after `npm install express`
+
 🔧 Open tasks
 • Write regression test for exp field validation
 
@@ -88,6 +91,23 @@ Next session briefing: "🚫 Bash: npm test: error: Exit code 1 · 3 tests faile
 ```
 
 You don't have to tell the agent to log anything. The hook does it.
+
+---
+
+## What fixed it
+
+A failure doesn't stay a "don't retry" forever. When the same command — or the same CI workflow on the same branch — succeeds later, jinamem moves it to **✅ Fixed** and records what made the difference:
+
+```
+✅ Fixed
+• npm test: "Error: Cannot find module 'express'" — fixed after `npm install express`
+• CI: CI on main: "TypeError … src/orders.ts:42" — fixed in c2d3e4f "Fix orders test"
+```
+
+- "Same command" ignores the noise agents add: `2>&1 | tail -20`, `cd dir && …`, a different description
+- The fix is the last meaningful commands run in between — `ls`, `cat`, `git status` and other looking-around commands are skipped
+- For CI it's the commit whose run passed
+- Fixes stay in the briefing for 14 days, so the next session knows both the problem and the answer
 
 ---
 
@@ -423,7 +443,7 @@ The dashboard is served at `http://localhost:3001` — sign in with your token t
 - [x] Sidecar log watcher (jinamem-watch)
 - [x] Claude Code, Codex, Cursor and Gemini CLI capture
 - [x] Build error extraction, background dev-server watching, GitHub Actions failures
-- [ ] Link fixes to failures ("fixed by…")
+- [x] Link fixes to failures ("fixed after…")
 - [ ] Session goal from the first prompt
 - [x] Cloud API + Postgres backend
 - [x] Dashboard (browse memory, search, sessions)

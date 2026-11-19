@@ -10,6 +10,7 @@ import {
   getEmbedder, embedBatch,
   serializeEmbedding, deserializeEmbedding,
 } from "./embedder.js";
+import { fixKey, legacyAction, describeFix, formatFixed, FIXED_VISIBLE_DAYS, type DeadEndMeta } from "./fixes.js";
 import {
   cosineSimilarity, reciprocalRankFusion, SIMILARITY_THRESHOLD,
 } from "./similarity.js";
@@ -230,13 +231,17 @@ export class SqliteStore implements JinamemStore {
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `).run(id, userId, project, sessionId, action, result ?? null, success ? 1 : 0, now);
 
-    // Auto-store failed attempts as dead ends
+    // Auto-store failed attempts as dead ends, keyed so a later success can resolve them
     if (!success) {
-      await this.remember(
+      const mem = await this.remember(
         userId, project,
         `[dead end] ${action}${result ? `: ${result}` : ""}`,
         false,
       );
+      const meta: DeadEndMeta = { deadEnd: true, key: fixKey(action), action };
+      this.db.prepare(`UPDATE memories SET metadata = ? WHERE id = ?`).run(JSON.stringify(meta), mem.id);
+    } else {
+      this.resolveDeadEnds(userId, project, action, result, now);
     }
 
     return { id, userId, project, sessionId, action, result, success, createdAt: new Date(now) };
@@ -291,6 +296,40 @@ export class SqliteStore implements JinamemStore {
     };
   }
 
+  /** A success resolves earlier dead ends for the same command or workflow. */
+  private resolveDeadEnds(userId: string, project: string, action: string, result: string | undefined, now: string) {
+    const key = fixKey(action);
+    if (!key) return;
+
+    const rows = this.db.prepare(`
+      SELECT id, content, metadata, created_at FROM memories
+      WHERE user_id = ? AND project = ? AND kind = 'fact'
+        AND content LIKE '[dead end]%'
+        AND json_extract(metadata, '$.resolved') IS NULL
+        AND created_at > ?
+    `).all(userId, project, new Date(Date.now() - 30 * 86_400_000).toISOString()) as Array<{
+      id: string; content: string; metadata: string; created_at: string;
+    }>;
+
+    for (const row of rows) {
+      let meta: DeadEndMeta = {};
+      try { meta = JSON.parse(row.metadata || "{}"); } catch { /* legacy row */ }
+      const rowKey = meta.key ?? fixKey(legacyAction(row.content));
+      if (rowKey !== key) continue;
+
+      // What ran in between is the likely fix
+      const between = (this.db.prepare(`
+        SELECT action FROM attempts
+        WHERE user_id = ? AND project = ? AND success = 1
+          AND created_at > ? AND created_at < ?
+        ORDER BY created_at ASC
+      `).all(userId, project, row.created_at, now) as Array<{ action: string }>).map(r => r.action);
+
+      meta.resolved = { at: now, fix: describeFix(key, action, result, between), via: action };
+      this.db.prepare(`UPDATE memories SET metadata = ? WHERE id = ?`).run(JSON.stringify(meta), row.id);
+    }
+  }
+
   async getBriefing(userId: string, project: string): Promise<Briefing> {
     const lastSession = await this.getLastSession(userId, project);
 
@@ -305,9 +344,18 @@ export class SqliteStore implements JinamemStore {
       SELECT content FROM memories
       WHERE user_id = ? AND project = ? AND kind = 'fact'
         AND content LIKE '[dead end]%'
-        AND created_at > datetime('now', '-30 days')
+        AND json_extract(metadata, '$.resolved') IS NULL
+        AND created_at > ?
       ORDER BY created_at DESC LIMIT 10
-    `).all(userId, project) as Array<{ content: string }>;
+    `).all(userId, project, new Date(Date.now() - 30 * 86_400_000).toISOString()) as Array<{ content: string }>;
+
+    const fixedRows = this.db.prepare(`
+      SELECT content, metadata FROM memories
+      WHERE user_id = ? AND project = ? AND kind = 'fact'
+        AND content LIKE '[dead end]%'
+        AND json_extract(metadata, '$.resolved.at') > ?
+      ORDER BY json_extract(metadata, '$.resolved.at') DESC LIMIT 5
+    `).all(userId, project, new Date(Date.now() - FIXED_VISIBLE_DAYS * 86_400_000).toISOString()) as Array<{ content: string; metadata: string }>;
 
     const taskRows = this.db.prepare(`
       SELECT content FROM memories
@@ -318,9 +366,10 @@ export class SqliteStore implements JinamemStore {
 
     const pinnedFacts = pinnedRows.map(r => r.content);
     const deadEnds = deadEndRows.map(r => r.content.replace("[dead end] ", ""));
+    const fixed = fixedRows.map(r => formatFixed(r.content, (JSON.parse(r.metadata) as DeadEndMeta).resolved!.fix));
     const openTasks = taskRows.map(r => r.content);
 
-    const totalChars = [...pinnedFacts, ...deadEnds, ...openTasks].join(" ").length;
+    const totalChars = [...pinnedFacts, ...deadEnds, ...fixed, ...openTasks].join(" ").length;
     const tokenEstimate = Math.round(totalChars / 4);
 
     return {
@@ -331,6 +380,7 @@ export class SqliteStore implements JinamemStore {
       } : undefined,
       pinnedFacts,
       deadEnds,
+      fixed,
       openTasks,
       tokenEstimate,
     };
