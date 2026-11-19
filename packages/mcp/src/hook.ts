@@ -1,62 +1,24 @@
 #!/usr/bin/env node
 /**
- * jinamem-hook — Claude Code PostToolUse / PostToolUseFailure hook
+ * jinamem-hook — captures what a coding agent's tools did, for any agent.
  *
- * Claude Code pipes a JSON event to stdin after each tool call.
- * PostToolUse fires only when a tool succeeds; failures arrive as
- * PostToolUseFailure, so both must be registered to capture dead ends.
- * This binary reads the event and logs the attempt to the jinamem store.
+ * Each agent pipes a JSON event to stdin after a tool runs. agents.ts turns
+ * Claude Code, Codex, Cursor and Gemini CLI payloads into one shape; this
+ * binary filters it, de-duplicates it and logs it to the jinamem store.
  *
- * Config in .claude/settings.json (written by jinamem-setup):
- * {
- *   "hooks": {
- *     "PostToolUse":        [{ "matcher": "Bash|Edit|MultiEdit|Write",
- *                              "hooks": [{ "type": "command", "command": "jinamem-hook" }] }],
- *     "PostToolUseFailure": [{ "matcher": "Bash|Edit|MultiEdit|Write",
- *                              "hooks": [{ "type": "command", "command": "jinamem-hook" }] }]
- *   }
- * }
+ *   jinamem-hook [--agent claude|codex|cursor|gemini]
+ *
+ * Without --agent the payload's shape decides. jinamem-setup writes the
+ * right config for each agent.
  */
 
 import { createStore, jinamemDir, type JinamemStore } from "@jinamem/core";
 import {
-  appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync,
+  appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync,
 } from "fs";
 import { resolve } from "path";
-import { randomUUID } from "crypto";
-
-// ─── Claude Code Hook Event Schema ───────────────────────────────────────────
-// https://code.claude.com/docs/en/hooks
-//
-// PostToolUse (tool succeeded):
-//   { hook_event_name: "PostToolUse", tool_name, tool_input, session_id, cwd,
-//     tool_response: { stdout, stderr, interrupted, isImage }   // Bash
-//                  | { filePath, type, ... }                     // Write / Edit }
-//
-// PostToolUseFailure (tool failed — there is no tool_response):
-//   { hook_event_name: "PostToolUseFailure", tool_name, tool_input, session_id, cwd,
-//     error: "Exit code 1\nError: Cannot find module 'express'", is_interrupt? }
-
-interface HookEvent {
-  hook_event_name: string;
-  tool_name: string;
-  tool_input: Record<string, unknown>;
-  tool_response?: {
-    stdout?: string;
-    stderr?: string;
-    interrupted?: boolean;
-    filePath?: string;
-    // older / non-Bash shapes
-    output?: string;
-    error?: string;
-  };
-  error?: string;           // PostToolUseFailure
-  is_interrupt?: boolean;   // PostToolUseFailure
-  session_id?: string;
-  cwd?: string;
-}
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+import { randomUUID, createHash } from "crypto";
+import { parseEvent, worthLogging, AGENTS, type Agent } from "./agents.js";
 
 // Must match the MCP server's project naming, or captured attempts never
 // show up in the briefing.
@@ -65,101 +27,36 @@ function getProject(cwd: string): string {
   return base.split("/").filter(Boolean).slice(-2).join("-") || "default";
 }
 
-function summarizeInput(event: HookEvent): string {
-  const { tool_name, tool_input } = event;
-
-  switch (tool_name) {
-    case "Bash": {
-      const cmd = String(tool_input.command ?? "").slice(0, 200);
-      const desc = tool_input.description ? ` (${tool_input.description})` : "";
-      return `Bash: ${cmd}${desc}`;
-    }
-    case "Edit":
-    case "MultiEdit": {
-      const file = String(tool_input.file_path ?? tool_input.path ?? "unknown file");
-      return `Edit: ${file}`;
-    }
-    case "Write": {
-      const file = String(tool_input.file_path ?? tool_input.path ?? "unknown file");
-      return `Write: ${file}`;
-    }
-    default:
-      return `${tool_name}: ${JSON.stringify(tool_input).slice(0, 200)}`;
-  }
+function agentArg(): Agent | undefined {
+  const i = process.argv.indexOf("--agent");
+  const v = i === -1 ? undefined : process.argv[i + 1];
+  return v && (AGENTS as string[]).includes(v) ? (v as Agent) : undefined;
 }
 
-function summarizeResult(event: HookEvent): { result: string; success: boolean } {
-  // Failure event: Claude Code reports the failure text in a top-level `error`
-  if (event.hook_event_name === "PostToolUseFailure") {
-    if (event.is_interrupt) return { result: "interrupted", success: false };
-    const err = (event.error ?? "failed").trim().replace(/\s*\n\s*/g, " · ");
-    return { result: `error: ${err.slice(0, 300)}`, success: false };
-  }
+// ─── De-duplication ──────────────────────────────────────────────────────────
+// Some agents report one failure through two events (e.g. Cursor's shell hook
+// and its tool-failure hook). Drop an identical capture seen moments ago.
 
-  const resp = event.tool_response;
-  if (!resp) return { result: "ok", success: true };
-  if (resp.interrupted) return { result: "interrupted by user", success: false };
+const DEDUPE_WINDOW_MS = 30_000;
+const recentPath = () => resolve(jinamemDir(), "recent.json");
 
-  switch (event.tool_name) {
-    case "Bash": {
-      const stdout = resp.stdout ?? resp.output ?? "";
-      const stderr = resp.stderr ?? resp.error ?? "";
-      // The command exited 0. Many tools write warnings to stderr, so stderr
-      // alone is not a failure — only clear failure markers count (these catch
-      // e.g. `npm test | tail`, where the pipe hides the non-zero exit code).
-      const failed = detectBashFailure(`${stdout}\n${stderr}`);
-      const text = (stdout.trim() || stderr.trim()).replace(/\s*\n\s*/g, " · ");
-      return { result: text.slice(0, 300) || "no output", success: !failed };
-    }
-    case "Edit":
-    case "MultiEdit":
-    case "Write": {
-      const file = String(event.tool_input.file_path ?? event.tool_input.path ?? "");
-      return {
-        result: `${event.tool_name === "Write" ? "wrote" : "edited"} ${file}`,
-        success: true,
-      };
-    }
-    default:
-      return { result: "ok", success: true };
-  }
+function seenRecently(key: string): boolean {
+  const now = Date.now();
+  let recent: Record<string, number> = {};
+  try { recent = JSON.parse(readFileSync(recentPath(), "utf8")); } catch { /* none yet */ }
+  for (const [k, t] of Object.entries(recent)) if (now - t > DEDUPE_WINDOW_MS) delete recent[k];
+  const dup = key in recent;
+  recent[key] = now;
+  try {
+    mkdirSync(jinamemDir(), { recursive: true });
+    writeFileSync(recentPath(), JSON.stringify(recent));
+  } catch { /* best effort */ }
+  return dup;
 }
-
-// Strong failure markers only — broad words like "failed" or "error:" also
-// appear in successful output ("0 failed", log lines) and would create
-// false dead ends.
-function detectBashFailure(text: string): boolean {
-  const failPatterns = [
-    /\b[1-9]\d* (tests? )?(failed|failing)\b/i,
-    /^npm err!/im,
-    /^npm error /im,
-    /traceback \(most recent call last\)/i,
-    /^\s*\w*error: /im,              // SyntaxError: / TypeError: / error: at line start
-    /command not found/i,
-    /no such file or directory/i,
-    /permission denied/i,
-    /segmentation fault/i,
-    /\bexit(ed)? (with )?(code|status) [1-9]/i,
-  ];
-  return failPatterns.some(p => p.test(text));
-}
-
-// Tools worth logging — skip noisy read-only tools
-const LOGGABLE_TOOLS = new Set([
-  "Bash", "Edit", "MultiEdit", "Write",
-  "mcp__jinamem__remember",  // avoid logging jinamem's own calls
-]);
-
-const SKIP_TOOLS = new Set([
-  "Read", "Glob", "Grep", "WebFetch", "WebSearch",
-  "mcp__jinamem__recall", "mcp__jinamem__what_was_i_doing",
-  "mcp__jinamem__remember", "mcp__jinamem__log_attempt",
-  "TodoRead", "TodoWrite",
-]);
 
 // ─── Cloud delivery + offline outbox ──────────────────────────────────────────
 
-// Hooks block Claude Code until they exit, so keep network calls short.
+// Hooks block the agent until they exit, so keep network calls short.
 const CLOUD_TIMEOUT_MS = Number(process.env.JINAMEM_HOOK_TIMEOUT_MS ?? 3000);
 const OUTBOX_MAX = 500;            // oldest entries are dropped beyond this
 const FLUSH_PER_RUN = 25;          // bound the extra latency of a single hook run
@@ -214,54 +111,40 @@ async function flushOutbox(store: JinamemStore) {
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 async function main() {
-  // Read stdin
-  const chunks: Buffer[] = [];
-  for await (const chunk of process.stdin) {
-    chunks.push(chunk as Buffer);
-  }
-
-  const raw = Buffer.concat(chunks).toString("utf8").trim();
-  if (!raw) process.exit(0);
-
-  let event: HookEvent;
-  try {
-    event = JSON.parse(raw) as HookEvent;
-  } catch {
-    // Not JSON — ignore silently
+  const agentHint = agentArg();
+  // Gemini CLI expects a JSON object on stdout; an empty one changes nothing
+  const done = () => {
+    if (agentHint === "gemini") process.stdout.write("{}\n");
     process.exit(0);
+  };
+
+  const chunks: Buffer[] = [];
+  for await (const chunk of process.stdin) chunks.push(chunk as Buffer);
+  const raw = Buffer.concat(chunks).toString("utf8").trim();
+  if (!raw) return done();
+
+  let payload: Record<string, unknown>;
+  try {
+    payload = JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    return done();   // not JSON — ignore
   }
 
-  // Only handle tool-completion events
-  if (event.hook_event_name !== "PostToolUse" &&
-      event.hook_event_name !== "PostToolUseFailure") process.exit(0);
+  const capture = parseEvent(payload, agentHint);
+  if (!capture || !worthLogging(capture)) return done();
 
-  // Skip read-only and jinamem's own tools
-  if (SKIP_TOOLS.has(event.tool_name)) process.exit(0);
-
-  // Skip tools we don't care about
-  if (!LOGGABLE_TOOLS.has(event.tool_name) && !event.tool_name.startsWith("mcp__")) {
-    // For unknown tools, only log if they look like write operations
-    const name = event.tool_name.toLowerCase();
-    const isWrite = name.includes("write") || name.includes("create") ||
-                    name.includes("edit") || name.includes("bash") ||
-                    name.includes("run") || name.includes("exec");
-    if (!isWrite) process.exit(0);
-  }
-
-  const cwd = event.cwd ?? process.cwd();
+  const cwd = capture.cwd || process.cwd();
   const project = getProject(cwd);
   const userId = process.env.JINAMEM_USER_ID ?? "local";
-  const sessionId = event.session_id ?? randomUUID();
+  const sessionId = capture.sessionId || randomUUID();
 
-  const action = summarizeInput(event);
-  const { result, success } = summarizeResult(event);
+  const key = createHash("sha1").update(`${project}\0${capture.action}\0${capture.success}`).digest("hex");
+  if (seenRecently(key)) return done();
 
-  // Skip trivially successful file writes — too noisy
-  // Only log: bash commands always, edits only on failure
-  const isBash = event.tool_name === "Bash";
-  if (!isBash && success) process.exit(0);
-
-  const entry: QueuedAttempt = { userId, project, sessionId, action, result, success };
+  const entry: QueuedAttempt = {
+    userId, project, sessionId,
+    action: capture.action, result: capture.result, success: capture.success,
+  };
   const { store, config } = createStore({ timeoutMs: CLOUD_TIMEOUT_MS });
 
   try {
@@ -282,14 +165,12 @@ async function main() {
     await store.close();
   }
 
-  // Exit 0 = hook succeeded, Claude Code continues normally
-  // Exit 1 = hook failed, Claude Code shows warning but continues
-  // Exit 2 = hook wants to block the tool (we never do this)
-  process.exit(0);
+  done();
 }
 
 main().catch(err => {
-  // Log to stderr (goes to Claude Code's debug log, not shown to user)
+  // stderr only — a hook must never break the agent
   console.error("[jinamem-hook] error:", err);
-  process.exit(0); // Always exit 0 — never block Claude Code
+  if (agentArg() === "gemini") process.stdout.write("{}\n");
+  process.exit(0);
 });

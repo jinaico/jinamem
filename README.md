@@ -4,6 +4,8 @@
 
 Your AI agent forgets everything between sessions. Jinamem fixes that — it's an MCP server that captures what your agent tried, what failed, and what it discovered, then gives it an instant briefing next time it starts.
 
+Works with **Claude Code, Codex, Cursor and Gemini CLI** — and they share one memory, so a dead end hit in Cursor is a dead end your Claude Code session already knows about.
+
 ```
 > what_was_i_doing()
 
@@ -32,7 +34,7 @@ Jinamem gives your agent a memory layer that persists across sessions, so it pic
 
 ---
 
-## Quickstart — Claude Code (30 seconds)
+## Quickstart (30 seconds)
 
 Requires Node.js 20 or later.
 
@@ -50,19 +52,30 @@ No global install? This works too (slightly slower hooks):
 npx -y -p @jinamem/mcp jinamem-setup
 ```
 
-That's it. Restart Claude Code and jinamem starts capturing your session automatically.
+That's it. `jinamem-setup` detects which coding agents you have installed and configures each one for this project. Restart your agent and jinamem starts capturing automatically. To pick agents yourself:
 
-What `jinamem-setup` does:
-- Adds the MCP server to `.mcp.json` and approves it in `.claude/settings.json`
-- Adds `PostToolUse` and `PostToolUseFailure` hooks so every Bash/Edit/Write call — including the ones that fail — is logged automatically
-- Safe to re-run; it never duplicates entries
+```bash
+jinamem-setup --agents claude,codex,cursor,gemini
+```
+
+What it writes, per agent:
+
+| Agent | MCP server | Automatic capture |
+|-------|-----------|-------------------|
+| Claude Code | `.mcp.json` (approved in `.claude/settings.json`) | `PostToolUse` + `PostToolUseFailure` hooks in `.claude/settings.json` |
+| Codex | `.codex/config.toml` | `PostToolUse` hook in `.codex/hooks.json` — run `/hooks` once to approve it, since Codex asks before running project hooks |
+| Cursor | `.cursor/mcp.json` | `afterShellExecution` + `postToolUseFailure` hooks in `.cursor/hooks.json` |
+| Gemini CLI | `.gemini/settings.json` | `AfterTool` hook in `.gemini/settings.json` |
+
+- Shell commands, failed edits and failed tool calls are captured — including the ones that fail
+- Existing config in those files is kept; re-running never duplicates entries
 - No manual tool calls needed — capture is automatic
 
 ---
 
 ## How automatic capture works
 
-jinamem ships a hook that Claude Code fires after every tool call — `PostToolUse` when it succeeds, `PostToolUseFailure` when it fails:
+jinamem ships one hook, `jinamem-hook`, that each agent runs after its tools. It understands every agent's event format — Claude Code's `PostToolUse`/`PostToolUseFailure`, Codex's `PostToolUse` (where a failed command shows up as a non-zero exit code), Cursor's `afterShellExecution`/`postToolUseFailure`, and Gemini CLI's `AfterTool`:
 
 ```
 Agent runs: Bash("npm test")
@@ -165,7 +178,7 @@ What jinamem-watch captures gets surfaced in your next briefing:
 
 ---
 
-## Manual setup (Cursor, Windsurf, other MCP hosts)
+## Manual setup (Windsurf and other MCP hosts)
 
 Add to your MCP config:
 
@@ -249,7 +262,8 @@ packages/
               types.ts, sqlite-store.ts, embedder.ts, similarity.ts, summarizer.ts
   mcp/      — MCP server + CLI tools
               server.ts    — 4 MCP tools + briefing resource + prompt injection
-              hook.ts      — PostToolUse/PostToolUseFailure hook (jinamem-hook binary)
+              hook.ts      — Capture hook for every agent (jinamem-hook binary)
+              agents.ts    — Parses Claude Code, Codex, Cursor and Gemini CLI hook events
               setup.ts     — One-command setup (jinamem-setup binary)
               watch.ts     — Sidecar log watcher (jinamem-watch binary)
   api/        — Cloud API server (Postgres + pgvector)
