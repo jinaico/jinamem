@@ -9,6 +9,10 @@ import {
   type JinamemStore,
 } from "@jinamem/core";
 import { randomUUID } from "crypto";
+import { projectName } from "./project.js";
+import { BackgroundWatcher } from "./background.js";
+import { syncCI } from "./ci.js";
+import { projectDir } from "./project.js";
 
 // ─── Bootstrap ───────────────────────────────────────────────────────────────
 
@@ -29,11 +33,26 @@ let SESSION_ID: string = randomUUID();
 // Store time when available, so cloud comparisons use the server's clock.
 let SESSION_STARTED_AT = new Date();
 
-// Derive project from cwd or env override
-function getProject(): string {
-  const cwd = process.env.JINAMEM_PROJECT ?? process.cwd();
-  return cwd.split("/").filter(Boolean).slice(-2).join("-") || "default";
+// Errors from dev servers / watchers the agent started in the background
+const background = new BackgroundWatcher(store, USER_ID, projectName(), () => SESSION_ID);
+
+// Failed GitHub Actions runs → dead ends. Synced at startup and before each
+// briefing; at most one sync at a time, and not more than once a minute.
+let ciSync: Promise<unknown> | null = null;
+let ciSyncedAt = 0;
+function refreshCI(waitMs: number): Promise<unknown> {
+  if (!ciSync && Date.now() - ciSyncedAt > 60_000) {
+    ciSync = syncCI(store, USER_ID, getProject(), projectDir())
+      .then(r => { if (!r.skipped && (r.failures || r.recoveries)) console.error(`[jinamem] CI: ${r.failures} failure(s), ${r.recoveries} recovery(ies)`); })
+      .catch(() => {})
+      .finally(() => { ciSync = null; ciSyncedAt = Date.now(); });
+  }
+  // Don't hold up the briefing for long if GitHub is slow
+  return Promise.race([ciSync ?? Promise.resolve(), new Promise(r => setTimeout(r, waitMs))]);
 }
+
+// Same project naming as the hook, jinamem-watch and CI capture
+const getProject = () => projectName();
 
 // Auto-start session on process start
 let sessionStarted = false;
@@ -72,6 +91,7 @@ server.resource(
   },
   async () => {
     await ensureSession();
+    await refreshCI(12_000);   // pick up CI failures since the last session
     const project = getProject();
     const briefing = await store.getBriefing(USER_ID, project);
     const lines: string[] = [
@@ -247,6 +267,7 @@ server.tool(
   {},
   async () => {
     await ensureSession();
+    await refreshCI(12_000);   // pick up CI failures since the last session
     const project = getProject();
     const briefing = await store.getBriefing(USER_ID, project);
     const lines: string[] = [];
@@ -326,6 +347,9 @@ async function shutdown(signal: string) {
   try {
     const project = getProject();
 
+    // Last look at background commands, so their crashes reach the summary
+    await background.stop();
+
     // 1. Try to summarize the session into decision-log entries
     const summaryClient = await getSummaryClient();
     if (summaryClient) {
@@ -403,6 +427,8 @@ function timeAgo(date: Date): string {
 
 export async function startServer() {
   await ensureSession();
+  background.start();
+  void refreshCI(0);   // start the CI sync now; the briefing waits for it
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error(`[jinamem] running · project: ${getProject()} · session: ${SESSION_ID}`);

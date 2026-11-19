@@ -21,6 +21,8 @@
  *                tool_response.error.
  */
 
+import { extractErrors } from "./logscan.js";
+
 export type Agent = "claude" | "codex" | "cursor" | "gemini";
 export const AGENTS: Agent[] = ["claude", "codex", "cursor", "gemini"];
 
@@ -28,7 +30,7 @@ export interface Capture {
   agent: Agent;
   kind: "shell" | "edit" | "tool";
   action: string;       // e.g. "Bash: npm test", "Edit: src/a.ts"
-  result: string;       // one line, ≤300 chars
+  result: string;       // one line: the error lines for failures, the last line for successes
   success: boolean;
   sessionId?: string;
   cwd?: string;
@@ -62,6 +64,8 @@ export function looksFailed(text: string): boolean {
     /permission denied/i,
     /segmentation fault/i,
     /\bexit(ed)? (with )?(code|status) [1-9]/i,
+    /^make(\[\d+\])?: \*\*\*/m,          // make: *** No rule to make target …
+    /^fatal: /m,                          // git
   ].some(p => p.test(text));
 }
 
@@ -138,7 +142,7 @@ function fromClaude(raw: Raw): Capture | null {
 
   if (ev === "PostToolUseFailure") {
     if (raw.is_interrupt) return null;   // the user stopped it — not a dead end
-    return { ...base, ...describe(tool, raw.tool_input), result: `error: ${oneLine(str(raw.error) || "failed")}`, success: false };
+    return { ...base, ...describe(tool, raw.tool_input), result: `error: ${extractErrors(str(raw.error), true) || "failed"}`, success: false };
   }
 
   const resp = (raw.tool_response ?? {}) as Raw;
@@ -147,9 +151,11 @@ function fromClaude(raw: Raw): Capture | null {
     const stdout = str(resp.stdout ?? resp.output);
     const stderr = str(resp.stderr ?? resp.error);
     // Exit code 0 here; stderr alone (warnings) is not a failure
+    const all = `${stdout}\n${stderr}`;
+    const failed = looksFailed(all);
     return { ...base, ...describe(tool, raw.tool_input),
-      result: oneLine(stdout || stderr) || "no output",
-      success: !looksFailed(`${stdout}\n${stderr}`) };
+      result: failed ? `error: ${extractErrors(all, true)}` : extractErrors(stdout || stderr, false) || "no output",
+      success: !failed };
   }
   return { ...base, ...describe(tool, raw.tool_input), result: "ok", success: true };
 }
@@ -165,18 +171,20 @@ function fromCodex(raw: Raw): Capture | null {
     // Codex has no failure event — judge by exit code, then by the output
     const code = exitCodeOf(resp);
     const failed = code !== undefined ? code !== 0 : looksFailed(text);
-    const body = oneLine(text.replace(/^(exit code|wall time|output):.*$/gim, "")) || oneLine(text);
+    const body = text.replace(/^(exit code|wall time|output):.*$/gim, "");
     return { ...base, kind: "shell", action: `Bash: ${commandOf(raw.tool_input)}`,
-      result: failed ? `error: ${code !== undefined ? `exit ${code} · ` : ""}${body}` : body || "no output",
+      result: failed
+        ? `error: ${code !== undefined ? `exit ${code} · ` : ""}${extractErrors(body, true)}`
+        : extractErrors(body, false) || "no output",
       success: !failed };
   }
   if (tool === "apply_patch") {
     const failed = /verification failed|failed to apply|invalid patch|error/i.test(text) && !/^success/i.test(text.trim());
     return { ...base, kind: "edit", action: `Edit: ${patchFiles(raw.tool_input)}`,
-      result: failed ? `failed: ${oneLine(text)}` : "edited", success: !failed };
+      result: failed ? `failed: ${extractErrors(text, true)}` : "edited", success: !failed };
   }
   const failed = !!(resp && typeof resp === "object" && (resp as Raw).isError);
-  return { ...base, ...describe(tool, raw.tool_input), result: failed ? `error: ${oneLine(text)}` : "ok", success: !failed };
+  return { ...base, ...describe(tool, raw.tool_input), result: failed ? `error: ${extractErrors(text, true)}` : "ok", success: !failed };
 }
 
 function fromCursor(raw: Raw): Capture | null {
@@ -192,14 +200,14 @@ function fromCursor(raw: Raw): Capture | null {
     const code = exitCodeOf(output);
     const failed = code !== undefined ? code !== 0 : looksFailed(output);
     return { ...base, kind: "shell", action: `Bash: ${str(raw.command).slice(0, 200)}`,
-      result: failed ? `error: ${oneLine(output)}` : oneLine(output) || "no output", success: !failed };
+      result: failed ? `error: ${extractErrors(output, true)}` : extractErrors(output, false) || "no output", success: !failed };
   }
   if (ev === "postToolUseFailure") {
     // Interrupts and permission denials are the user's choice, not dead ends
     if (raw.is_interrupt || raw.failure_type === "permission_denied") return null;
     const tool = str(raw.tool_name);
     const why = raw.failure_type === "timeout" ? "timed out" : "error";
-    return { ...base, ...describe(tool, raw.tool_input), result: `${why}: ${oneLine(str(raw.error_message) || "failed")}`, success: false };
+    return { ...base, ...describe(tool, raw.tool_input), result: `${why}: ${extractErrors(str(raw.error_message), true) || "failed"}`, success: false };
   }
   return null;
 }
@@ -216,7 +224,7 @@ function fromGemini(raw: Raw): Capture | null {
     const code = exitCodeOf(text);
     const failed = !!err || (code !== undefined ? code !== 0 : looksFailed(text));
     return { ...base, kind: "shell", action: `Bash: ${commandOf(raw.tool_input)}`,
-      result: failed ? `error: ${oneLine(err || text)}` : oneLine(text) || "no output", success: !failed };
+      result: failed ? `error: ${err ? oneLine(err) : extractErrors(text, true)}` : extractErrors(text, false) || "no output", success: !failed };
   }
   return { ...base, ...describe(tool, raw.tool_input),
     result: err ? `error: ${oneLine(err)}` : "ok", success: !err };

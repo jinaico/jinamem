@@ -19,13 +19,9 @@ import {
 import { resolve } from "path";
 import { randomUUID, createHash } from "crypto";
 import { parseEvent, worthLogging, AGENTS, type Agent } from "./agents.js";
+import { projectName as getProject } from "./project.js";
+import { isBackgroundStart, findOutputFile, registerBackground } from "./background.js";
 
-// Must match the MCP server's project naming, or captured attempts never
-// show up in the briefing.
-function getProject(cwd: string): string {
-  const base = process.env.JINAMEM_PROJECT ?? cwd;
-  return base.split("/").filter(Boolean).slice(-2).join("-") || "default";
-}
 
 function agentArg(): Agent | undefined {
   const i = process.argv.indexOf("--agent");
@@ -128,6 +124,16 @@ async function main() {
     payload = JSON.parse(raw) as Record<string, unknown>;
   } catch {
     return done();   // not JSON — ignore
+  }
+
+  // A dev server or watcher started in the background: remember its output
+  // file so the MCP server can watch it for crashes for the rest of the session
+  if (isBackgroundStart(payload)) {
+    try {
+      const file = findOutputFile(payload.tool_response);
+      const cmd = String((payload.tool_input as Record<string, unknown>)?.command ?? "");
+      if (file) registerBackground(getProject(String(payload.cwd || process.cwd())), cmd, file);
+    } catch { /* best effort */ }
   }
 
   const capture = parseEvent(payload, agentHint);

@@ -326,7 +326,8 @@ function main() {
   }
   console.log("\nNext:");
   for (const [agent, r] of results) console.log(`  • ${NAMES[agent]}: ${r.next}`);
-  console.log("\nOne memory is shared by every agent in this project.\n");
+  console.log("\nOne memory is shared by every agent in this project.");
+  console.log("Tip: start servers with `jinamem-run npm run dev` so crashes are remembered too.\n");
 }
 
 main();

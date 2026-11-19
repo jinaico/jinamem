@@ -129,9 +129,56 @@ Without a key, jinamem still works — agents use `remember()` manually and the 
 
 ---
 
-## Watching app logs (jinamem-watch)
+## Build errors, runtime crashes and CI failures
 
-Run `jinamem-watch` alongside your app and it captures errors, crashes, and warnings into memory automatically — even when no agent is active. Next time you open Claude Code, your briefing already knows what broke.
+jinamem doesn't only remember what the agent's commands did — it also catches what broke in the build, in the running app and in CI, so the next session starts knowing.
+
+### Build errors — automatic
+
+When the agent runs a build or test command, jinamem keeps **the actual error**, not the first screenful of progress output. A 400-line `next build` becomes:
+
+```
+🚫 Bash: npm run build: error: ./src/app/api/orders/route.ts:42:18 Type error: Property 'userId' does not exist on type 'Session'.
+```
+
+It picks out error lines and their file:line location (TypeScript, Rust, Python tracebacks, Go, Java…), and drops boilerplate like `npm error code 1` or `make: *** Error 2`.
+
+### Dev servers the agent starts — automatic (Claude Code)
+
+When Claude Code starts a dev server or watcher in the background (`npm run dev`, `uvicorn`, `cargo watch`…), jinamem notes the file its output goes to and the MCP server keeps reading it for the rest of the session. A crash ten minutes later is saved even if the agent never looks:
+
+```
+🚫 Runtime: npm run dev: error: ⨯ TypeError: Cannot read properties of undefined (reading 'userId') at GET (src/app/api/orders/route.ts:42:18)
+```
+
+The agent's commands are never changed — jinamem only reads the output file the agent itself writes. The same error repeating is saved once.
+
+### Servers you start yourself — `jinamem-run`
+
+Put `jinamem-run` in front of any command. Output passes through unchanged; errors and crashes go to memory:
+
+```bash
+jinamem-run npm run dev
+jinamem-run python manage.py runserver
+jinamem-run --level error -- docker compose up
+```
+
+### CI failures — automatic (GitHub Actions)
+
+If the project is on GitHub and you have the [GitHub CLI](https://cli.github.com) signed in (`gh auth login`), jinamem checks for failed workflow runs when a session starts and before each briefing — and pulls the real error out of the failed step's log:
+
+```
+🚫 CI: Deploy on main (d3e4f5a): failed: npm error ERESOLVE could not resolve dependency peer react@"^18" from next@15.2 · Bump deps · https://github.com/…/runs/103
+```
+
+- No tokens or webhooks to set up — it uses your existing `gh` login
+- First use imports only the last 7 days; at most 5 new failures per check
+- A run that passes after a failure is recorded as a recovery
+- `jinamem-ci` runs the check by hand (or from cron); `JINAMEM_CI=off` turns it off
+
+### Log files and production — `jinamem-watch`
+
+Run `jinamem-watch` alongside your app and it captures errors, crashes, and warnings into memory automatically — even when no agent is active.
 
 Run it from your project directory so captures land in the same project your agent's briefing reads. (Or set the same `JINAMEM_PROJECT` for both the watcher and the MCP server.)
 
@@ -140,10 +187,9 @@ Run it from your project directory so captures land in the same project your age
 jinamem-watch --follow /var/log/myapp.log
 ```
 
-**Wrap a process (output passes through, errors are captured):**
+**Wrap a process** (same as `jinamem-run`):
 ```bash
 jinamem-watch --pipe "npm run dev"
-jinamem-watch --pipe "node server.js"
 ```
 
 **Filter level** (default: `warn`):
@@ -249,6 +295,8 @@ JINAMEM_PROJECT=my-project jinamem-mcp
 | `JINAMEM_API_URL` | `https://jinamem.dev` | Cloud API URL (for self-hosted cloud) |
 | `JINAMEM_HOME` | `~/.jinamem` | Directory for the local DB, `config.json` and the offline outbox |
 | `JINAMEM_HOOK_TIMEOUT_MS` | `3000` | Max time the hook waits on the cloud API before queueing |
+| `JINAMEM_CI` | on | Set to `off` to skip GitHub Actions checks |
+| `JINAMEM_BG_POLL_MS` | `10000` | How often background command output is checked |
 
 The token and API URL can also be saved with `jinamem-setup --token ... [--api-url ...]`; environment variables take precedence over the saved config.
 
@@ -266,6 +314,11 @@ packages/
               agents.ts    — Parses Claude Code, Codex, Cursor and Gemini CLI hook events
               setup.ts     — One-command setup (jinamem-setup binary)
               watch.ts     — Sidecar log watcher (jinamem-watch binary)
+              run.ts       — jinamem-run wrapper
+              logscan.ts   — Error-line detection and extraction from long output
+              background.ts — Watches output of background commands the agent starts
+              ci.ts        — GitHub Actions failures via gh (jinamem-ci binary)
+              project.ts   — One project name shared by every process
   api/        — Cloud API server (Postgres + pgvector)
   dashboard/  — Web UI for browsing memory
 ```
@@ -368,6 +421,10 @@ The dashboard is served at `http://localhost:3001` — sign in with your token t
 - [x] PostToolUse hook (auto-capture)
 - [x] Session summarizer (decision log)
 - [x] Sidecar log watcher (jinamem-watch)
+- [x] Claude Code, Codex, Cursor and Gemini CLI capture
+- [x] Build error extraction, background dev-server watching, GitHub Actions failures
+- [ ] Link fixes to failures ("fixed by…")
+- [ ] Session goal from the first prompt
 - [x] Cloud API + Postgres backend
 - [x] Dashboard (browse memory, search, sessions)
 - [ ] Hosted cloud version (jinamem.dev)
