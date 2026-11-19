@@ -20,7 +20,9 @@ import { createReadStream, statSync, watchFile } from "fs";
 import { createInterface } from "readline";
 import { spawn } from "child_process";
 import { createStore, type JinamemStore } from "@jinamem/core";
+import { classify, type LogEvent, type Severity } from "./logscan.js";
 import { randomUUID } from "crypto";
+import { projectName } from "./project.js";
 
 // ─── CLI args ─────────────────────────────────────────────────────────────────
 
@@ -48,9 +50,8 @@ function parseArgs(): {
     process.exit(1);
   }
 
-  const cwd = process.env.JINAMEM_PROJECT
-    ? process.env.JINAMEM_PROJECT
-    : process.cwd().split("/").filter(Boolean).slice(-2).join("-") || "default";
+  // Same naming as the MCP server and hook; --project overrides it
+  const cwd = projectName();
 
   return {
     follow,
@@ -60,82 +61,6 @@ function parseArgs(): {
     userId:    process.env.JINAMEM_USER_ID ?? "local",
     sessionId: randomUUID(),
   };
-}
-
-// ─── Log event classification ─────────────────────────────────────────────────
-
-type Severity = "error" | "warn" | "info" | "debug";
-
-interface LogEvent {
-  raw: string;
-  severity: Severity;
-  message: string;
-  source?: string;    // e.g. file path, service name
-  timestamp: Date;
-}
-
-const ERROR_PATTERNS: RegExp[] = [
-  /\b(error|err|fatal|critical|exception|crash|panic)\b/i,
-  /\btypeerror\b/i,
-  /\breferenceerror\b/i,
-  /\bsyntaxerror\b/i,
-  /\buncaught\b/i,
-  /\bunhandled (promise rejection|rejection)\b/i,
-  /exit code [^0]/i,
-  /exited with \d*[1-9]/i,
-  /oom|out of memory/i,
-  /segfault|segmentation fault/i,
-  /\bfailed to\b/i,
-  /\bcannot find module\b/i,
-  /\benoent\b/i,
-  /\bconnection refused\b/i,
-  /\btimeout\b.*\bexceeded\b/i,
-  /\b(5[0-9]{2})\b.*\b(error|fail)/i,  // HTTP 5xx
-  /npm err!/i,
-  /traceback \(most recent call\)/i,
-  /panic:/i,
-];
-
-const WARN_PATTERNS: RegExp[] = [
-  /\b(warn|warning|deprecated|deprecation)\b/i,
-  /\bretrying\b/i,
-  /\bslowly\b/i,
-  /\bhigh (memory|cpu|latency)\b/i,
-  /\b4[0-9]{2}\b/,  // HTTP 4xx
-];
-
-// Noise to ignore even if they match above patterns
-const NOISE_PATTERNS: RegExp[] = [
-  /^\s*$/,                    // blank lines
-  /^[\s\-=*#]+$/,             // dividers
-  /\bchecking\b.*\bfor errors\b/i,
-  /\bno errors found\b/i,
-  /\berror count: 0\b/i,
-  /\b0 errors\b/i,
-];
-
-function classify(line: string): LogEvent {
-  const raw = line.trim();
-  const lower = raw.toLowerCase();
-  let severity: Severity = "info";
-
-  // Check noise first
-  const isNoise = NOISE_PATTERNS.some(p => p.test(raw));
-  if (!isNoise) {
-    if (ERROR_PATTERNS.some(p => p.test(raw))) severity = "error";
-    else if (WARN_PATTERNS.some(p => p.test(raw))) severity = "warn";
-    else if (lower.includes("debug") || lower.includes("trace")) severity = "debug";
-  }
-
-  // Try to extract a clean message (strip timestamps, log prefixes)
-  const message = raw
-    .replace(/^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}[.\d]*Z?\s*/i, "")  // ISO timestamp
-    .replace(/^\[\d{2}:\d{2}:\d{2}\]\s*/i, "")                              // [HH:MM:SS]
-    .replace(/^(ERROR|WARN|INFO|DEBUG|FATAL)\s*[:|\]]\s*/i, "")             // log level prefix
-    .replace(/^\d+\s+/i, "")                                                  // leading PID
-    .trim() || raw;
-
-  return { raw, severity, message, timestamp: new Date() };
 }
 
 // ─── Deduplication ────────────────────────────────────────────────────────────

@@ -40,7 +40,7 @@ test("claude: PostToolUseFailure is a dead end, flattened to one line", () => {
     error: "Exit code 1\nError: Cannot find module 'express'", session_id: "s1", cwd,
   })!;
   assert.equal(c.success, false);
-  assert.equal(c.result, "error: Exit code 1 · Error: Cannot find module 'express'");
+  assert.equal(c.result, "error: Error: Cannot find module 'express'");   // "Exit code 1" adds nothing
 });
 
 test("claude: failed Edit is logged, successful Edit is not", () => {
@@ -131,7 +131,7 @@ test("cursor: shell output judged by content; project from workspace root", () =
 test("cursor: clean shell output is a success", () => {
   const c = parseEvent({ hook_event_name: "afterShellExecution", command: "ls", output: "src\nREADME.md", workspace_roots: [cwd] })!;
   assert.equal(c.success, true);
-  assert.equal(c.result, "src · README.md");
+  assert.equal(c.result, "README.md");   // last line of successful output
 });
 
 test("cursor: tool failures are dead ends; permission denials and interrupts are not", () => {
@@ -188,4 +188,96 @@ test("exitCodeOf reads structured and text forms", () => {
   assert.equal(exitCodeOf("Exit code: 127\nOutput:"), 127);
   assert.equal(exitCodeOf("Process exited with code 3"), 3);
   assert.equal(exitCodeOf("all good"), undefined);
+});
+
+// ─── Long build output ───────────────────────────────────────────────────────
+
+import { extractErrors } from "./logscan.js";
+
+const nextBuild = [
+  "> next build",
+  "  ▲ Next.js 15.2",
+  "  Creating an optimized production build ...",
+  ...Array.from({ length: 400 }, (_, i) => `  Compiling page ${i}/400 ...`),
+  "Failed to compile.",
+  "",
+  "./src/app/api/orders/route.ts:42:18",
+  "Type error: Property 'userId' does not exist on type 'Session'.",
+  "  40 |   const session = await getSession();",
+  "> 42 |   const id = session.userId;",
+  "npm error Lifecycle script `build` failed with error:",
+  "npm error code 1",
+].join("\n");
+
+test("build: the type error at the end survives, progress noise doesn't", () => {
+  const out = extractErrors(nextBuild, true);
+  assert.equal(out, "./src/app/api/orders/route.ts:42:18 Type error: Property 'userId' does not exist on type 'Session'.");
+  assert.doesNotMatch(out, /Compiling page|npm error/);
+  assert.ok(out.length <= 400);
+});
+
+test("build: claude captures the real error from a failed next build", () => {
+  const c = parseEvent({
+    hook_event_name: "PostToolUseFailure", tool_name: "Bash", tool_input: { command: "npm run build" },
+    error: "Exit code 1\n" + nextBuild, cwd,
+  })!;
+  assert.match(c.result, /Property 'userId' does not exist/);
+});
+
+test("build: rust error keeps its location line", () => {
+  const out = extractErrors([
+    "   Compiling app v0.1.0",
+    "error[E0425]: cannot find value `cfg` in this scope",
+    "  --> src/main.rs:12:5",
+    "error: could not compile `app` (bin \"app\") due to 1 previous error",
+  ].join("\n"), true);
+  assert.equal(out, "error[E0425]: cannot find value `cfg` in this scope --> src/main.rs:12:5");
+});
+
+test("build: python traceback keeps the final exception", () => {
+  const out = extractErrors([
+    "Traceback (most recent call last):",
+    '  File "app.py", line 3, in <module>',
+    "    import flask",
+    "ModuleNotFoundError: No module named 'flask'",
+  ].join("\n"), true);
+  assert.match(out, /ModuleNotFoundError: No module named 'flask'/);
+});
+
+test("build: success keeps the last meaningful line", () => {
+  assert.equal(extractErrors("Compiling...\n\n✓ Compiled successfully\n", false), "✓ Compiled successfully");
+});
+
+test("build: failure with no recognizable error falls back to the last lines", () => {
+  assert.equal(extractErrors("step 1\nstep 2\nstep 3\ngave up\n", true), "step 2 · step 3 · gave up");
+});
+
+// ─── CI ──────────────────────────────────────────────────────────────────────
+
+import { githubRepo, summarizeFailedLog } from "./ci.js";
+
+test("ci: GitHub remotes in ssh and https form", () => {
+  assert.equal(githubRepo("git@github.com:acme/shop-api.git"), "acme/shop-api");
+  assert.equal(githubRepo("https://github.com/acme/shop-api"), "acme/shop-api");
+  assert.equal(githubRepo("https://gitlab.com/acme/shop-api.git"), undefined);
+});
+
+test("ci: failed-step log keeps the cause, drops job/step/timestamp prefixes and boilerplate", () => {
+  const log = [
+    "deploy\tDeploy\t2026-11-19T07:12:00.0Z Building image...",
+    "deploy\tDeploy\t2026-11-19T07:12:40.0Z ERROR: failed to solve: process \"/bin/sh -c npm ci\" did not complete successfully: exit code: 1",
+    "deploy\tDeploy\t2026-11-19T07:12:40.1Z npm error ERESOLVE could not resolve dependency peer react@\"^18\" from next@15.2",
+    "deploy\tDeploy\t2026-11-19T07:12:40.2Z npm error A complete log of this run can be found in: /root/.npm/_logs/x.log",
+    "deploy\tDeploy\t2026-11-19T07:12:41.0Z ##[error]Process completed with exit code 1.",
+  ].join("\n");
+  const out = summarizeFailedLog(log);
+  assert.match(out, /ERESOLVE could not resolve dependency/);
+  assert.doesNotMatch(out, /2026-11-19T|A complete log|Process completed/);
+});
+
+test("cursor: make and git failures are recognized without an exit code", () => {
+  for (const output of ["make: *** No rule to make target 'deploy'.  Stop.", "fatal: not a git repository (or any of the parent directories): .git"]) {
+    const c = parseEvent({ hook_event_name: "afterShellExecution", command: "x", output, workspace_roots: [cwd] })!;
+    assert.equal(c.success, false, output);
+  }
 });

@@ -1,14 +1,16 @@
 {
   "name": "@jinamem/mcp",
   "version": "0.1.0",
-  "description": "MCP server — gives your AI agent persistent memory across sessions",
+  "description": "MCP server \u2014 gives your AI agent persistent memory across sessions",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "bin": {
     "jinamem-mcp": "./dist/cli.js",
     "jinamem-hook": "./dist/hook.js",
     "jinamem-setup": "./dist/setup.js",
-    "jinamem-watch": "./dist/watch.js"
+    "jinamem-watch": "./dist/watch.js",
+    "jinamem-run": "./dist/run.js",
+    "jinamem-ci": "./dist/ci-cli.js"
   },
   "exports": {
     ".": {
