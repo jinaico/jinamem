@@ -259,12 +259,62 @@ Add your token to the config:
       "command": "npx",
       "args": ["@jinamem/mcp"],
       "env": {
-        "JINAMEM_TOKEN": "am_live_your_token_here"
+        "JINAMEM_TOKEN": "am_live_your_token_here",
+        "JINAMEM_API_URL": "https://jinamem.dev"
       }
     }
   }
 }
 ```
+
+The MCP server auto-detects the token at startup and switches to cloud mode. Local SQLite mode is used when no token is set — no config change needed.
+
+---
+
+## Self-hosting the cloud version
+
+The API server (`packages/api`) + dashboard (`packages/dashboard`) can be deployed anywhere Docker runs.
+
+```bash
+# 1. Clone the repo
+git clone https://github.com/siddharthjinagouda/jinamem
+cd jinamem
+
+# 2. Build the dashboard
+cd packages/dashboard && npm install && npm run build && cd ../..
+
+# 3. Configure
+cp .env.example .env
+# Edit .env — set POSTGRES_PASSWORD, JWT_SECRET, PUBLIC_URL
+
+# 4. Start
+docker compose -f docker-compose.cloud.yml up -d
+
+# 5. Create your first user
+curl -X POST http://localhost:3001/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"email":"you@example.com"}'
+# → returns {"token": "am_live_..."}
+```
+
+The dashboard is served at `http://localhost:3001` — sign in with your token to browse memory.
+
+**API endpoints:**
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/auth/register` | Create user, returns token + ready-to-paste MCP config |
+| `GET`  | `/auth/me` | Current user info |
+| `GET`  | `/v1/briefing?project=` | Full session briefing |
+| `POST` | `/v1/remember` | Store a fact |
+| `POST` | `/v1/recall` | Semantic + keyword search |
+| `POST` | `/v1/attempt` | Log an attempt |
+| `POST` | `/v1/session/start` | Start a session |
+| `POST` | `/v1/session/end` | End a session |
+| `GET`  | `/v1/memories?project=` | List all memories |
+| `DELETE` | `/v1/memories/:id` | Delete a memory |
+| `GET`  | `/v1/projects` | List all projects |
+| `GET`  | `/v1/sessions?project=` | Session history |
 
 ---
 
@@ -272,10 +322,13 @@ Add your token to the config:
 
 - [x] SQLite local storage
 - [x] 4 core MCP tools
-- [ ] Dashboard UI
+- [x] PostToolUse hook (auto-capture)
+- [x] Session summarizer (decision log)
+- [x] Sidecar log watcher (jinamem-watch)
+- [x] Cloud API + Postgres backend
+- [x] Dashboard (browse memory, search, sessions)
 - [ ] Hosted cloud version (jinamem.dev)
 - [ ] Team / org shared memory
-- [ ] Vector search for better recall
 - [ ] VS Code extension
 
 ---

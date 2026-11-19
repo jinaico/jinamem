@@ -3,9 +3,11 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import {
   SqliteStore,
+  CloudStore,
   getSummaryClient,
   buildSummaryPrompt,
   parseSummaryOutput,
+  type JinamemStore,
 } from "@jinamem/core";
 import { mkdirSync } from "fs";
 import { resolve } from "path";
@@ -16,11 +18,20 @@ import { randomUUID } from "crypto";
 
 const USER_ID   = process.env.JINAMEM_USER_ID ?? "local";
 const DB_PATH   = process.env.JINAMEM_DB_PATH;
+const TOKEN     = process.env.JINAMEM_TOKEN;
+const API_URL   = process.env.JINAMEM_API_URL ?? "https://jinamem.dev";
 
-const defaultDir = resolve(homedir(), ".jinamem");
-mkdirSync(defaultDir, { recursive: true });
-
-const store = new SqliteStore(DB_PATH);
+// Auto-select store: cloud if JINAMEM_TOKEN is set, local SQLite otherwise
+let store: JinamemStore;
+if (TOKEN) {
+  store = new CloudStore(TOKEN, API_URL);
+  console.error(`[jinamem] cloud mode · ${API_URL}`);
+} else {
+  const defaultDir = resolve(homedir(), ".jinamem");
+  mkdirSync(defaultDir, { recursive: true });
+  store = new SqliteStore(DB_PATH);
+  console.error(`[jinamem] local mode · ${DB_PATH ?? "~/.jinamem/memory.db"}`);
+}
 
 // One session ID per process — one MCP server process = one agent session
 const SESSION_ID = randomUUID();

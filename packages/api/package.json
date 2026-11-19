@@ -1,0 +1,29 @@
+{
+  "name": "@jinamem/api",
+  "version": "0.1.0",
+  "private": true,
+  "description": "jinamem cloud API server (Fastify + Postgres)",
+  "type": "module",
+  "main": "./dist/server.js",
+  "scripts": {
+    "build": "tsc --skipLibCheck",
+    "start": "node dist/server.js",
+    "dev": "tsx watch src/server.ts",
+    "migrate": "node dist/migrate.js"
+  },
+  "dependencies": {
+    "@jinamem/core": "*",
+    "fastify": "^4.26.2",
+    "@fastify/cors": "^9.0.1",
+    "@fastify/jwt": "^8.0.1",
+    "@fastify/static": "^7.0.4",
+    "postgres": "^3.4.3",
+    "nanoid": "^5.0.7",
+    "zod": "^3.22.4"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.3.3"
+  }
+}
