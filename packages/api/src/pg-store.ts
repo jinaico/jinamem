@@ -236,6 +236,20 @@ export class PgStore implements JinamemStore {
     };
   }
 
+  async getProjectAttempts(userId: string, project: string, since: Date, limit = 500): Promise<Attempt[]> {
+    const rows = await this.sql<{ id: string; user_id: string; project: string; session_id: string; action: string; result: string | null; success: boolean; created_at: Date }[]>`
+      SELECT * FROM (
+        SELECT * FROM attempts
+        WHERE user_id = ${userId} AND project = ${project} AND created_at >= ${since}
+        ORDER BY created_at DESC LIMIT ${limit}
+      ) recent ORDER BY created_at ASC
+    `;
+    return rows.map(r => ({
+      id: r.id, userId: r.user_id, project: r.project, sessionId: r.session_id,
+      action: r.action, result: r.result ?? undefined, success: r.success, createdAt: r.created_at,
+    }));
+  }
+
   async getSessionAttempts(sessionId: string): Promise<Attempt[]> {
     const rows = await this.sql<{ id: string; user_id: string; project: string; session_id: string; action: string; result: string | null; success: boolean; created_at: Date }[]>`
       SELECT * FROM attempts WHERE session_id = ${sessionId} ORDER BY created_at ASC

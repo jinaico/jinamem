@@ -24,6 +24,10 @@ console.error(config.mode === "cloud"
 // One session per process — one MCP server process = one agent session.
 // Replaced by the store's own session ID once the session row exists.
 let SESSION_ID: string = randomUUID();
+// When this session began — the decision log covers everything captured in
+// the project from here on (hook and watcher captures use other session IDs).
+// Store time when available, so cloud comparisons use the server's clock.
+let SESSION_STARTED_AT = new Date();
 
 // Derive project from cwd or env override
 function getProject(): string {
@@ -38,6 +42,7 @@ async function ensureSession() {
   try {
     const session = await store.startSession(USER_ID, getProject());
     SESSION_ID = session.id;   // attempts and endSession must use the stored ID
+    SESSION_STARTED_AT = session.startedAt;
     sessionStarted = true;
   } catch (err) {
     // e.g. cloud unreachable at startup — keep serving, retry on next tool call
@@ -328,7 +333,9 @@ async function shutdown(signal: string) {
         console.error(`[jinamem] summarizing session with ${summaryClient.name}...`);
 
         const [attempts, pinnedFacts] = await Promise.all([
-          store.getSessionAttempts(SESSION_ID),
+          // Every attempt in the project since this session started: the
+          // agent's own log_attempt calls plus hook and watcher captures
+          store.getProjectAttempts(USER_ID, project, SESSION_STARTED_AT),
           store.getPinnedFacts(USER_ID, project),
         ]);
 

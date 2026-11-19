@@ -41,107 +41,77 @@ export class CloudStore implements JinamemStore {
     return res.json() as Promise<T>;
   }
 
+  // The API serialises store objects as-is: camelCase fields, dates as ISO
+  // strings. Revive the date fields so callers get real Date objects.
+  private static revive<T>(raw: Record<string, unknown>): T {
+    const out: Record<string, unknown> = { ...raw };
+    for (const k of ["createdAt", "expiresAt", "startedAt", "endedAt"]) {
+      const v = out[k];
+      if (typeof v === "string") out[k] = new Date(v);
+      else if (v === null) out[k] = undefined;
+    }
+    return out as T;
+  }
+
+  private post<T>(path: string, body: unknown): Promise<T> {
+    return this.fetch<T>(path, { method: "POST", body: JSON.stringify(body) });
+  }
+
   async remember(userId: string, project: string, note: string, pin = false): Promise<Memory> {
-    const raw = await this.fetch<{ id: string; kind: string; content: string; created_at: string; expires_at: string | null }>("/v1/remember", {
-      method: "POST",
-      body: JSON.stringify({ note, pin, project }),
-    });
-    return {
-      id: raw.id,
-      userId,
-      project,
-      kind: raw.kind as Memory["kind"],
-      content: raw.content,
-      metadata: {},
-      createdAt: new Date(raw.created_at),
-      expiresAt: raw.expires_at ? new Date(raw.expires_at) : undefined,
-    };
+    return CloudStore.revive<Memory>(await this.post("/v1/remember", { note, pin, project }));
   }
 
   async recall(userId: string, project: string, query: string, limit = 10): Promise<RecallResult[]> {
-    const raw = await this.fetch<Array<{ content: string; kind: string; project: string; created_at: string; score: number }>>("/v1/recall", {
-      method: "POST",
-      body: JSON.stringify({ query, limit, project }),
-    });
-    return raw.map(r => ({
-      content: r.content,
-      kind: r.kind as RecallResult["kind"],
-      project: r.project,
-      createdAt: new Date(r.created_at),
-      score: r.score,
-    }));
+    const raw = await this.post<Record<string, unknown>[]>("/v1/recall", { query, limit, project });
+    return raw.map(r => CloudStore.revive<RecallResult>(r));
   }
 
   async logAttempt(userId: string, project: string, sessionId: string, action: string, result?: string, success = true): Promise<Attempt> {
-    const raw = await this.fetch<{ id: string; created_at: string }>("/v1/attempt", {
-      method: "POST",
-      body: JSON.stringify({ sessionId, action, result, success, project }),
-    });
-    return { id: raw.id, userId, project, sessionId, action, result, success, createdAt: new Date(raw.created_at) };
+    return CloudStore.revive<Attempt>(await this.post("/v1/attempt", { sessionId, action, result, success, project }));
   }
 
   async startSession(userId: string, project: string, task?: string): Promise<Session> {
-    const raw = await this.fetch<{ id: string; started_at: string }>("/v1/session/start", {
-      method: "POST",
-      body: JSON.stringify({ project, task }),
-    });
-    return { id: raw.id, userId, project, task, startedAt: new Date(raw.started_at) };
+    return CloudStore.revive<Session>(await this.post("/v1/session/start", { project, task }));
   }
 
   async endSession(sessionId: string, summary?: string): Promise<Session> {
-    const raw = await this.fetch<{ id: string; user_id: string; project: string; task: string | null; summary: string | null; started_at: string; ended_at: string | null }>("/v1/session/end", {
-      method: "POST",
-      body: JSON.stringify({ sessionId, summary }),
-    });
-    return {
-      id: raw.id,
-      userId: raw.user_id,
-      project: raw.project,
-      task: raw.task ?? undefined,
-      summary: raw.summary ?? undefined,
-      startedAt: new Date(raw.started_at),
-      endedAt: raw.ended_at ? new Date(raw.ended_at) : undefined,
-    };
+    return CloudStore.revive<Session>(await this.post("/v1/session/end", { sessionId, summary }));
   }
 
   async getLastSession(userId: string, project: string): Promise<Session | null> {
     try {
-      const raw = await this.fetch<{ id: string; user_id: string; project: string; task: string | null; summary: string | null; started_at: string; ended_at: string | null } | null>(
+      const raw = await this.fetch<Record<string, unknown> | null>(
         `/v1/session/last?project=${encodeURIComponent(project)}`,
       );
-      if (!raw) return null;
-      return {
-        id: raw.id, userId: raw.user_id, project: raw.project,
-        task: raw.task ?? undefined, summary: raw.summary ?? undefined,
-        startedAt: new Date(raw.started_at),
-        endedAt: raw.ended_at ? new Date(raw.ended_at) : undefined,
-      };
+      return raw ? CloudStore.revive<Session>(raw) : null;
     } catch {
       return null;
     }
   }
 
   async getBriefing(userId: string, project: string): Promise<Briefing> {
-    // Dates arrive as ISO strings over JSON — revive them to match the interface
-    const raw = await this.fetch<Omit<Briefing, "lastSession"> & {
-      lastSession?: { task?: string; endedAt: string; status: NonNullable<Briefing["lastSession"]>["status"] };
-    }>(`/v1/briefing?project=${encodeURIComponent(project)}`);
+    const raw = await this.fetch<Briefing & { lastSession?: Record<string, unknown> }>(
+      `/v1/briefing?project=${encodeURIComponent(project)}`,
+    );
     return {
       ...raw,
       lastSession: raw.lastSession
-        ? { ...raw.lastSession, endedAt: new Date(raw.lastSession.endedAt) }
+        ? CloudStore.revive<NonNullable<Briefing["lastSession"]>>(raw.lastSession)
         : undefined,
     };
   }
 
   async getSessionAttempts(sessionId: string): Promise<Attempt[]> {
-    const raw = await this.fetch<Array<{ id: string; user_id: string; project: string; session_id: string; action: string; result: string | null; success: boolean; created_at: string }>>(
+    const raw = await this.fetch<Record<string, unknown>[]>(
       `/v1/session/${encodeURIComponent(sessionId)}/attempts`,
     );
-    return raw.map(r => ({
-      id: r.id, userId: r.user_id, project: r.project, sessionId: r.session_id,
-      action: r.action, result: r.result ?? undefined, success: r.success, createdAt: new Date(r.created_at),
-    }));
+    return raw.map(r => CloudStore.revive<Attempt>(r));
+  }
+
+  async getProjectAttempts(userId: string, project: string, since: Date, limit = 500): Promise<Attempt[]> {
+    const q = new URLSearchParams({ project, since: since.toISOString(), limit: String(limit) });
+    const raw = await this.fetch<Record<string, unknown>[]>(`/v1/attempts?${q}`);
+    return raw.map(r => CloudStore.revive<Attempt>(r));
   }
 
   async getPinnedFacts(userId: string, project: string): Promise<string[]> {
