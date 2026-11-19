@@ -13,6 +13,7 @@
  *   POST /v1/session/end         — endSession(sessionId, summary?)
  *   GET  /v1/session/last        — getLastSession(project)
  *   GET  /v1/session/:id/attempts
+ *   GET  /v1/attempts?project=&since=&limit=  — all attempts in a project since a time
  *
  *   GET  /v1/memories            — list all memories for a project
  *   DELETE /v1/memories/:id      — delete a memory
@@ -114,16 +115,22 @@ app.post("/auth/register", async (req, reply) => {
   `;
 
   const user = rows[0]!;
+  const apiUrl = process.env.PUBLIC_URL ?? "https://jinamem.dev";
   reply.status(201).send({
     token: user.token,
     userId: user.id,
     plan: user.plan,
+    // Claude Code: one command saves the token where the MCP server, the
+    // hook and jinamem-watch can all read it (~/.jinamem/config.json).
+    setupCommand: `npx -y -p @jinamem/mcp jinamem-setup --token ${user.token}` +
+      (apiUrl === "https://jinamem.dev" ? "" : ` --api-url ${apiUrl}`),
+    // Other MCP hosts (no hooks): paste into the MCP config
     mcpConfig: {
       mcpServers: {
         jinamem: {
           command: "npx",
-          args: ["@jinamem/mcp"],
-          env: { JINAMEM_TOKEN: user.token, JINAMEM_API_URL: process.env.PUBLIC_URL ?? "https://jinamem.dev" },
+          args: ["-y", "-p", "@jinamem/mcp", "jinamem-mcp"],
+          env: { JINAMEM_TOKEN: user.token, JINAMEM_API_URL: apiUrl },
         },
       },
     },
@@ -194,11 +201,15 @@ app.post("/v1/session/start", async (req) => {
   return store.startSession(getUserId(req), body.project ?? "default", body.task);
 });
 
-app.post("/v1/session/end", async (req) => {
+app.post("/v1/session/end", async (req, reply) => {
   const body = z.object({
     sessionId: z.string(),
     summary: z.string().optional(),
   }).parse(req.body);
+
+  // Only the session's owner may end it
+  const owned = await sql`SELECT 1 FROM sessions WHERE id = ${body.sessionId} AND user_id = ${getUserId(req)}`;
+  if (owned.length === 0) return reply.status(404).send({ error: "session not found" });
 
   const store = new PgStore(sql);
   return store.endSession(body.sessionId, body.summary);
@@ -211,7 +222,17 @@ app.get<{ Querystring: { project?: string } }>("/v1/session/last", async (req) =
 
 app.get<{ Params: { id: string } }>("/v1/session/:id/attempts", async (req) => {
   const store = new PgStore(sql);
-  return store.getSessionAttempts(req.params.id);
+  // Only the caller's own attempts — session IDs are not secrets
+  const userId = getUserId(req);
+  return (await store.getSessionAttempts(req.params.id)).filter(a => a.userId === userId);
+});
+
+app.get<{ Querystring: { project?: string; since?: string; limit?: string } }>("/v1/attempts", async (req, reply) => {
+  const since = new Date(req.query.since ?? 0);
+  if (Number.isNaN(since.getTime())) return reply.status(400).send({ error: "invalid since" });
+  const limit = Math.min(Math.max(parseInt(req.query.limit ?? "500") || 500, 1), 1000);
+  const store = new PgStore(sql);
+  return store.getProjectAttempts(getUserId(req), req.query.project ?? "default", since, limit);
 });
 
 // ─── Routes: Dashboard data ───────────────────────────────────────────────────

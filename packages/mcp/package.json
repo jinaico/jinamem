@@ -5,8 +5,8 @@
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "bin": {
-    "jinamem-mcp":   "./dist/cli.js",
-    "jinamem-hook":  "./dist/hook.js",
+    "jinamem-mcp": "./dist/cli.js",
+    "jinamem-hook": "./dist/hook.js",
     "jinamem-setup": "./dist/setup.js",
     "jinamem-watch": "./dist/watch.js"
   },
@@ -19,10 +19,11 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
-    "start": "node dist/cli.js"
+    "start": "node dist/cli.js",
+    "prepack": "cp ../../README.md ../../LICENSE ."
   },
   "dependencies": {
-    "@jinamem/core": "*",
+    "@jinamem/core": "^0.1.0",
     "@modelcontextprotocol/sdk": "^1.0.4",
     "zod": "^3.22.4"
   },
@@ -35,6 +36,27 @@
     "dist"
   ],
   "keywords": [
-    "mcp", "memory", "agent", "claude", "cursor", "ai", "llm"
-  ]
+    "mcp",
+    "memory",
+    "agent",
+    "claude",
+    "cursor",
+    "ai",
+    "llm"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jinaico/jinamem.git",
+    "directory": "packages/mcp"
+  },
+  "homepage": "https://github.com/jinaico/jinamem#readme",
+  "bugs": {
+    "url": "https://github.com/jinaico/jinamem/issues"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
 }

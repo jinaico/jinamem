@@ -75,6 +75,10 @@ export interface JinamemStore {
 
   // Summarization
   getSessionAttempts(sessionId: string): Promise<Attempt[]>;
+  /** All attempts in a project since a time, from any source — the MCP
+   *  server's log_attempt, the Claude Code hook (which uses Claude's own
+   *  session ID) and jinamem-watch. Oldest first, at most `limit`. */
+  getProjectAttempts(userId: string, project: string, since: Date, limit?: number): Promise<Attempt[]>;
   getPinnedFacts(userId: string, project: string): Promise<string[]>;
 
   // Housekeeping

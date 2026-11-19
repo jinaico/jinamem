@@ -11,8 +11,22 @@ import type {
 } from "@jinamem/core";
 import { getEmbedder } from "@jinamem/core";
 
+// Whether memories.embedding exists (only created when pgvector is installed).
+// Checked once per process; without it, recall is keyword-only.
+let hasVectorColumn: Promise<boolean> | null = null;
+
 export class PgStore implements JinamemStore {
   constructor(private sql: postgres.Sql) {}
+
+  private vectorsEnabled(): Promise<boolean> {
+    if (!hasVectorColumn) {
+      hasVectorColumn = this.sql<{ n: number }[]>`
+        SELECT count(*)::int AS n FROM information_schema.columns
+        WHERE table_name = 'memories' AND column_name = 'embedding'
+      `.then(r => r[0]!.n > 0).catch(() => false);
+    }
+    return hasVectorColumn;
+  }
 
   async remember(userId: string, project: string, note: string, pin = false): Promise<Memory> {
     const id = randomUUID();
@@ -20,23 +34,30 @@ export class PgStore implements JinamemStore {
 
     // Try to embed
     let embeddingStr: string | null = null;
+    const vectors = await this.vectorsEnabled();
     try {
-      const embedder = await getEmbedder();
+      const embedder = vectors ? await getEmbedder() : null;
       if (embedder) {
         const vec = await embedder.embed(note);
         embeddingStr = `[${vec.join(",")}]`;
       }
     } catch { /* non-fatal */ }
 
-    const rows = await this.sql<{ id: string; created_at: Date; expires_at: Date | null }[]>`
-      INSERT INTO memories (id, user_id, project, kind, content, pinned, embedding, created_at, expires_at)
-      VALUES (
-        ${id}, ${userId}, ${project}, 'fact', ${note}, ${pin},
-        ${embeddingStr ? this.sql`${embeddingStr}::vector` : this.sql`NULL`},
-        NOW(), ${expiresAt}
-      )
-      RETURNING id, created_at, expires_at
-    `;
+    const rows = vectors
+      ? await this.sql<{ id: string; created_at: Date; expires_at: Date | null }[]>`
+          INSERT INTO memories (id, user_id, project, kind, content, pinned, embedding, created_at, expires_at)
+          VALUES (
+            ${id}, ${userId}, ${project}, 'fact', ${note}, ${pin},
+            ${embeddingStr ? this.sql`${embeddingStr}::vector` : this.sql`NULL`},
+            NOW(), ${expiresAt}
+          )
+          RETURNING id, created_at, expires_at
+        `
+      : await this.sql<{ id: string; created_at: Date; expires_at: Date | null }[]>`
+          INSERT INTO memories (id, user_id, project, kind, content, pinned, created_at, expires_at)
+          VALUES (${id}, ${userId}, ${project}, 'fact', ${note}, ${pin}, NOW(), ${expiresAt})
+          RETURNING id, created_at, expires_at
+        `;
 
     const row = rows[0]!;
     return {
@@ -74,7 +95,7 @@ export class PgStore implements JinamemStore {
 
     // Try semantic search
     try {
-      const embedder = await getEmbedder();
+      const embedder = (await this.vectorsEnabled()) ? await getEmbedder() : null;
       if (embedder) {
         const vec = await embedder.embed(query);
         const vecStr = `[${vec.join(",")}]`;
@@ -98,8 +119,9 @@ export class PgStore implements JinamemStore {
         const merged = Array.from(all).map(content => {
           const kr = keywordRanks.has(content) ? 1 / (60 + keywordRanks.get(content)!) : 0;
           const sr = semanticRanks.has(content) ? 1 / (60 + semanticRanks.get(content)!) : 0;
-          const row = keywordScored.find(r => r.content === content) ?? semanticRows.find(r => r.content === content)!;
-          return { content, createdAt: row.created_at, score: kr + sr };
+          const kw = keywordScored.find(r => r.content === content);
+          const createdAt = kw ? kw.createdAt : semanticRows.find(r => r.content === content)!.created_at;
+          return { content, createdAt, score: kr + sr };
         }).sort((a, b) => b.score - a.score).slice(0, limit);
 
         return merged.map(r => ({
@@ -212,6 +234,20 @@ export class PgStore implements JinamemStore {
       openTasks,
       tokenEstimate: Math.round(totalChars / 4),
     };
+  }
+
+  async getProjectAttempts(userId: string, project: string, since: Date, limit = 500): Promise<Attempt[]> {
+    const rows = await this.sql<{ id: string; user_id: string; project: string; session_id: string; action: string; result: string | null; success: boolean; created_at: Date }[]>`
+      SELECT * FROM (
+        SELECT * FROM attempts
+        WHERE user_id = ${userId} AND project = ${project} AND created_at >= ${since}
+        ORDER BY created_at DESC LIMIT ${limit}
+      ) recent ORDER BY created_at ASC
+    `;
+    return rows.map(r => ({
+      id: r.id, userId: r.user_id, project: r.project, sessionId: r.session_id,
+      action: r.action, result: r.result ?? undefined, success: r.success, createdAt: r.created_at,
+    }));
   }
 
   async getSessionAttempts(sessionId: string): Promise<Attempt[]> {

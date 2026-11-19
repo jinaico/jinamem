@@ -19,10 +19,7 @@
 import { createReadStream, statSync, watchFile } from "fs";
 import { createInterface } from "readline";
 import { spawn } from "child_process";
-import { SqliteStore } from "@jinamem/core";
-import { mkdirSync } from "fs";
-import { resolve } from "path";
-import { homedir } from "os";
+import { createStore, type JinamemStore } from "@jinamem/core";
 import { randomUUID } from "crypto";
 
 // ─── CLI args ─────────────────────────────────────────────────────────────────
@@ -146,6 +143,7 @@ function classify(line: string): LogEvent {
 
 interface SeenEntry {
   message: string;
+  severity: Severity;
   count: number;
   firstSeen: Date;
   lastSeen: Date;
@@ -179,6 +177,7 @@ function recordEvent(event: LogEvent): boolean {
 
   seen.set(key, {
     message: event.message,
+    severity: event.severity,
     count: 1,
     firstSeen: event.timestamp,
     lastSeen: event.timestamp,
@@ -199,13 +198,16 @@ function cleanupSeen() {
 
 // ─── Store writer ─────────────────────────────────────────────────────────────
 
-let store: SqliteStore | null = null;
+// Cloud if a token is set (JINAMEM_TOKEN or ~/.jinamem/config.json), local SQLite otherwise
+let store: JinamemStore | null = null;
 
-function getStore(): SqliteStore {
+function getStore(): JinamemStore {
   if (!store) {
-    const dbDir = resolve(homedir(), ".jinamem");
-    mkdirSync(dbDir, { recursive: true });
-    store = new SqliteStore(process.env.JINAMEM_DB_PATH);
+    const created = createStore({ timeoutMs: 10_000 });
+    store = created.store;
+    console.error(created.config.mode === "cloud"
+      ? `[jinamem-watch] cloud mode · ${created.config.apiUrl}`
+      : `[jinamem-watch] local mode · ${created.config.dbPath}`);
   }
   return store;
 }
@@ -222,22 +224,31 @@ async function flushToStore(
 
     const severityOk =
       level === "all" ||
-      (level === "error" && entry.message.match(/error|fatal|crash|panic/i)) ||
+      (level === "error" && entry.severity === "error") ||
       (level === "warn" && true); // warn includes errors too
 
     if (!severityOk) continue;
 
-    const isError = /error|fatal|crash|panic|exception|failed/i.test(entry.message);
+    // Use the severity detected from the raw line — the stored message has
+    // prefixes like "Error:" stripped, so re-matching it misses real errors
+    const isError = entry.severity === "error";
     const countSuffix = entry.count > 1 ? ` (×${entry.count})` : "";
     const prefix = isError ? "[app error]" : "[app warning]";
     const content = `${prefix} ${entry.message}${countSuffix}`;
 
-    await s.logAttempt(
-      userId, project, sessionId,
-      `watch: ${entry.message.slice(0, 100)}`,
-      content,
-      !isError, // success=false for errors → auto-stored as dead ends
-    );
+    try {
+      await s.logAttempt(
+        userId, project, sessionId,
+        `watch: ${entry.message.slice(0, 100)}`,
+        content,
+        !isError, // success=false for errors → auto-stored as dead ends
+      );
+    } catch (err) {
+      // Store unreachable (e.g. cloud outage) — keep the rest unwritten and
+      // retry on the next flush instead of crashing the watcher
+      console.error(`[jinamem-watch] write failed, will retry: ${(err as Error).message}`);
+      break;
+    }
 
     entry.written = true;
     flushed++;

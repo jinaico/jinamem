@@ -336,6 +336,24 @@ export class SqliteStore implements JinamemStore {
     };
   }
 
+  async getProjectAttempts(userId: string, project: string, since: Date, limit = 500): Promise<Attempt[]> {
+    const rows = this.db.prepare(`
+      SELECT * FROM (
+        SELECT * FROM attempts
+        WHERE user_id = ? AND project = ? AND created_at >= ?
+        ORDER BY created_at DESC LIMIT ?
+      ) ORDER BY created_at ASC
+    `).all(userId, project, since.toISOString(), limit) as Array<{
+      id: string; user_id: string; project: string; session_id: string;
+      action: string; result: string | null; success: number; created_at: string;
+    }>;
+    return rows.map(r => ({
+      id: r.id, userId: r.user_id, project: r.project, sessionId: r.session_id,
+      action: r.action, result: r.result ?? undefined, success: r.success === 1,
+      createdAt: new Date(r.created_at),
+    }));
+  }
+
   async getSessionAttempts(sessionId: string): Promise<Attempt[]> {
     const rows = this.db.prepare(`
       SELECT * FROM attempts WHERE session_id = ? ORDER BY created_at ASC

@@ -1,67 +1,68 @@
 #!/usr/bin/env node
 /**
- * jinamem-hook — Claude Code PostToolUse hook
+ * jinamem-hook — Claude Code PostToolUse / PostToolUseFailure hook
  *
- * Claude Code pipes a JSON event to stdin on every tool call.
- * This binary reads it, determines success/failure, and logs
- * the attempt to the jinamem SQLite store directly.
+ * Claude Code pipes a JSON event to stdin after each tool call.
+ * PostToolUse fires only when a tool succeeds; failures arrive as
+ * PostToolUseFailure, so both must be registered to capture dead ends.
+ * This binary reads the event and logs the attempt to the jinamem store.
  *
- * Config in .claude/settings.json:
+ * Config in .claude/settings.json (written by jinamem-setup):
  * {
  *   "hooks": {
- *     "PostToolUse": [{
- *       "matcher": "Bash|Edit|Write|MultiEdit",
- *       "hooks": [{ "type": "command", "command": "jinamem-hook" }]
- *     }]
+ *     "PostToolUse":        [{ "matcher": "Bash|Edit|MultiEdit|Write",
+ *                              "hooks": [{ "type": "command", "command": "jinamem-hook" }] }],
+ *     "PostToolUseFailure": [{ "matcher": "Bash|Edit|MultiEdit|Write",
+ *                              "hooks": [{ "type": "command", "command": "jinamem-hook" }] }]
  *   }
  * }
  */
 
-import { SqliteStore } from "@jinamem/core";
-import { mkdirSync } from "fs";
+import { createStore, jinamemDir, type JinamemStore } from "@jinamem/core";
+import {
+  appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync,
+} from "fs";
 import { resolve } from "path";
-import { homedir } from "os";
 import { randomUUID } from "crypto";
 
 // ─── Claude Code Hook Event Schema ───────────────────────────────────────────
-// https://docs.anthropic.com/en/docs/claude-code/hooks
+// https://code.claude.com/docs/en/hooks
 //
-// PostToolUse stdin payload:
-// {
-//   "hook_event_name": "PostToolUse",
-//   "tool_name": "Bash",
-//   "tool_input": { "command": "npm test", "description": "Run tests" },
-//   "tool_response": {
-//     "output": "...",        // stdout for Bash
-//     "error": "...",         // stderr or error message
-//     "interrupted": false
-//   },
-//   "session_id": "abc123",
-//   "cwd": "/home/user/my-project"
-// }
+// PostToolUse (tool succeeded):
+//   { hook_event_name: "PostToolUse", tool_name, tool_input, session_id, cwd,
+//     tool_response: { stdout, stderr, interrupted, isImage }   // Bash
+//                  | { filePath, type, ... }                     // Write / Edit }
+//
+// PostToolUseFailure (tool failed — there is no tool_response):
+//   { hook_event_name: "PostToolUseFailure", tool_name, tool_input, session_id, cwd,
+//     error: "Exit code 1\nError: Cannot find module 'express'", is_interrupt? }
 
 interface HookEvent {
   hook_event_name: string;
   tool_name: string;
   tool_input: Record<string, unknown>;
   tool_response?: {
+    stdout?: string;
+    stderr?: string;
+    interrupted?: boolean;
+    filePath?: string;
+    // older / non-Bash shapes
     output?: string;
     error?: string;
-    interrupted?: boolean;
-    filePath?: string;       // Write tool
-    newFile?: boolean;
-    // Edit/MultiEdit
-    old_content?: string;
-    new_content?: string;
   };
+  error?: string;           // PostToolUseFailure
+  is_interrupt?: boolean;   // PostToolUseFailure
   session_id?: string;
   cwd?: string;
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
+// Must match the MCP server's project naming, or captured attempts never
+// show up in the briefing.
 function getProject(cwd: string): string {
-  return cwd.split("/").filter(Boolean).slice(-2).join("-") || "default";
+  const base = process.env.JINAMEM_PROJECT ?? cwd;
+  return base.split("/").filter(Boolean).slice(-2).join("-") || "default";
 }
 
 function summarizeInput(event: HookEvent): string {
@@ -88,73 +89,58 @@ function summarizeInput(event: HookEvent): string {
 }
 
 function summarizeResult(event: HookEvent): { result: string; success: boolean } {
-  const resp = event.tool_response;
-  if (!resp) return { result: "no response", success: true };
-
-  const { tool_name } = event;
-
-  if (resp.interrupted) {
-    return { result: "interrupted by user", success: false };
+  // Failure event: Claude Code reports the failure text in a top-level `error`
+  if (event.hook_event_name === "PostToolUseFailure") {
+    if (event.is_interrupt) return { result: "interrupted", success: false };
+    const err = (event.error ?? "failed").trim().replace(/\s*\n\s*/g, " · ");
+    return { result: `error: ${err.slice(0, 300)}`, success: false };
   }
 
-  switch (tool_name) {
+  const resp = event.tool_response;
+  if (!resp) return { result: "ok", success: true };
+  if (resp.interrupted) return { result: "interrupted by user", success: false };
+
+  switch (event.tool_name) {
     case "Bash": {
-      const output = resp.output ?? "";
-      const error  = resp.error ?? "";
-
-      // Heuristics for failure detection
-      const failed = detectBashFailure(output, error);
-
-      const summary = error
-        ? `error: ${error.slice(0, 300)}`
-        : output.slice(0, 300) || "no output";
-
-      return { result: summary, success: !failed };
+      const stdout = resp.stdout ?? resp.output ?? "";
+      const stderr = resp.stderr ?? resp.error ?? "";
+      // The command exited 0. Many tools write warnings to stderr, so stderr
+      // alone is not a failure — only clear failure markers count (these catch
+      // e.g. `npm test | tail`, where the pipe hides the non-zero exit code).
+      const failed = detectBashFailure(`${stdout}\n${stderr}`);
+      const text = (stdout.trim() || stderr.trim()).replace(/\s*\n\s*/g, " · ");
+      return { result: text.slice(0, 300) || "no output", success: !failed };
     }
     case "Edit":
     case "MultiEdit":
     case "Write": {
-      const error = resp.error ?? "";
-      if (error) return { result: `failed: ${error.slice(0, 300)}`, success: false };
       const file = String(event.tool_input.file_path ?? event.tool_input.path ?? "");
       return {
         result: `${event.tool_name === "Write" ? "wrote" : "edited"} ${file}`,
         success: true,
       };
     }
-    default: {
-      const error = resp.error ?? "";
-      return error
-        ? { result: `error: ${error.slice(0, 200)}`, success: false }
-        : { result: "ok", success: true };
-    }
+    default:
+      return { result: "ok", success: true };
   }
 }
 
-// Detect bash command failures from output content
-function detectBashFailure(output: string, error: string): boolean {
-  if (error && error.trim().length > 0) return true;
-
-  const text = output.toLowerCase();
+// Strong failure markers only — broad words like "failed" or "error:" also
+// appear in successful output ("0 failed", log lines) and would create
+// false dead ends.
+function detectBashFailure(text: string): boolean {
   const failPatterns = [
-    /\berror\b.*:/,
-    /\bfailed\b/,
-    /\bfailure\b/,
-    /exit code [^0]/,
-    /exited with \d*[1-9]/,
-    /npm err!/i,
-    /syntax error/,
-    /traceback/,
-    /exception:/,
-    /typeerror/,
-    /referenceerror/,
-    /cannot find/,
-    /no such file/,
-    /permission denied/,
-    /command not found/,
-    /enoent/,
+    /\b[1-9]\d* (tests? )?(failed|failing)\b/i,
+    /^npm err!/im,
+    /^npm error /im,
+    /traceback \(most recent call last\)/i,
+    /^\s*\w*error: /im,              // SyntaxError: / TypeError: / error: at line start
+    /command not found/i,
+    /no such file or directory/i,
+    /permission denied/i,
+    /segmentation fault/i,
+    /\bexit(ed)? (with )?(code|status) [1-9]/i,
   ];
-
   return failPatterns.some(p => p.test(text));
 }
 
@@ -170,6 +156,60 @@ const SKIP_TOOLS = new Set([
   "mcp__jinamem__remember", "mcp__jinamem__log_attempt",
   "TodoRead", "TodoWrite",
 ]);
+
+// ─── Cloud delivery + offline outbox ──────────────────────────────────────────
+
+// Hooks block Claude Code until they exit, so keep network calls short.
+const CLOUD_TIMEOUT_MS = Number(process.env.JINAMEM_HOOK_TIMEOUT_MS ?? 3000);
+const OUTBOX_MAX = 500;            // oldest entries are dropped beyond this
+const FLUSH_PER_RUN = 25;          // bound the extra latency of a single hook run
+
+interface QueuedAttempt {
+  userId: string; project: string; sessionId: string;
+  action: string; result: string; success: boolean;
+}
+
+const outboxPath = () => resolve(jinamemDir(), "outbox.jsonl");
+
+function sendAttempt(store: JinamemStore, a: QueuedAttempt) {
+  return store.logAttempt(a.userId, a.project, a.sessionId, a.action, a.result, a.success);
+}
+
+function queue(...entries: QueuedAttempt[]) {
+  if (entries.length === 0) return;
+  mkdirSync(jinamemDir(), { recursive: true });
+  appendFileSync(outboxPath(), entries.map(e => JSON.stringify(e)).join("\n") + "\n");
+  // Cap the file so a long outage can't grow it without bound
+  const lines = readFileSync(outboxPath(), "utf8").split("\n").filter(Boolean);
+  if (lines.length > OUTBOX_MAX) {
+    const tmp = `${outboxPath()}.${process.pid}.trim`;
+    appendFileSync(tmp, lines.slice(-OUTBOX_MAX).join("\n") + "\n");
+    renameSync(tmp, outboxPath());
+  }
+}
+
+async function flushOutbox(store: JinamemStore) {
+  const path = outboxPath();
+  if (!existsSync(path)) return;
+
+  // Claim the file atomically — parallel tool calls run parallel hooks,
+  // and only one of them should send each queued entry.
+  const claimed = `${path}.${process.pid}.${randomUUID()}`;
+  try { renameSync(path, claimed); } catch { return; }
+
+  const entries = readFileSync(claimed, "utf8").split("\n").filter(Boolean)
+    .map(l => { try { return JSON.parse(l) as QueuedAttempt; } catch { return null; } })
+    .filter((e): e is QueuedAttempt => e !== null);
+  unlinkSync(claimed);
+
+  let i = 0;
+  try {
+    for (; i < entries.length && i < FLUSH_PER_RUN; i++) await sendAttempt(store, entries[i]);
+  } catch {
+    // Still offline — keep everything not yet sent
+  }
+  queue(...entries.slice(i));
+}
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
@@ -191,8 +231,9 @@ async function main() {
     process.exit(0);
   }
 
-  // Only handle PostToolUse
-  if (event.hook_event_name !== "PostToolUse") process.exit(0);
+  // Only handle tool-completion events
+  if (event.hook_event_name !== "PostToolUse" &&
+      event.hook_event_name !== "PostToolUseFailure") process.exit(0);
 
   // Skip read-only and jinamem's own tools
   if (SKIP_TOOLS.has(event.tool_name)) process.exit(0);
@@ -220,14 +261,23 @@ async function main() {
   const isBash = event.tool_name === "Bash";
   if (!isBash && success) process.exit(0);
 
-  // Open store
-  const dbDir = resolve(homedir(), ".jinamem");
-  mkdirSync(dbDir, { recursive: true });
-
-  const store = new SqliteStore(process.env.JINAMEM_DB_PATH);
+  const entry: QueuedAttempt = { userId, project, sessionId, action, result, success };
+  const { store, config } = createStore({ timeoutMs: CLOUD_TIMEOUT_MS });
 
   try {
-    await store.logAttempt(userId, project, sessionId, action, result, success);
+    if (config.mode === "cloud") {
+      // Never lose a capture to a network blip: queue it locally and retry
+      // on the next hook run.
+      await flushOutbox(store);
+      try {
+        await sendAttempt(store, entry);
+      } catch (err) {
+        queue(entry);
+        console.error("[jinamem-hook] cloud unreachable, queued:", (err as Error).message);
+      }
+    } else {
+      await sendAttempt(store, entry);
+    }
   } finally {
     await store.close();
   }
