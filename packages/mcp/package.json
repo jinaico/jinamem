@@ -20,7 +20,8 @@
     "build": "tsc",
     "dev": "tsc --watch",
     "start": "node dist/cli.js",
-    "prepack": "cp ../../README.md ../../LICENSE ."
+    "prepack": "cp ../../README.md ../../LICENSE .",
+    "test": "tsc && node --test dist/*.test.js"
   },
   "dependencies": {
     "@jinamem/core": "^0.1.0",
@@ -33,7 +34,8 @@
   },
   "license": "MIT",
   "files": [
-    "dist"
+    "dist",
+    "!dist/**/*.test.*"
   ],
   "keywords": [
     "mcp",
