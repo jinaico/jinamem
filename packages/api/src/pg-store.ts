@@ -9,7 +9,9 @@ import type {
   JinamemStore, Memory, Attempt, Session,
   Briefing, RecallResult, MemoryKind,
 } from "@jinamem/core";
-import { getEmbedder } from "@jinamem/core";
+import {
+  getEmbedder, fixKey, legacyAction, describeFix, formatFixed, FIXED_VISIBLE_DAYS, type DeadEndMeta,
+} from "@jinamem/core";
 
 // Whether memories.embedding exists (only created when pgvector is installed).
 // Checked once per process; without it, recall is keyword-only.
@@ -145,14 +147,45 @@ export class PgStore implements JinamemStore {
 
   async logAttempt(userId: string, project: string, sessionId: string, action: string, result?: string, success = true): Promise<Attempt> {
     const id = randomUUID();
-    await this.sql`
+    const [{ created_at: now }] = await this.sql<{ created_at: Date }[]>`
       INSERT INTO attempts (id, user_id, project, session_id, action, result, success)
       VALUES (${id}, ${userId}, ${project}, ${sessionId}, ${action}, ${result ?? null}, ${success})
+      RETURNING created_at
     `;
     if (!success) {
-      await this.remember(userId, project, `[dead end] ${action}${result ? `: ${result}` : ""}`, false);
+      // Dead end, keyed so a later success can resolve it
+      const mem = await this.remember(userId, project, `[dead end] ${action}${result ? `: ${result}` : ""}`, false);
+      const meta: DeadEndMeta = { deadEnd: true, key: fixKey(action), action };
+      await this.sql`UPDATE memories SET metadata = ${this.sql.json(meta as never)} WHERE id = ${mem.id}`;
+    } else {
+      await this.resolveDeadEnds(userId, project, action, result, now);
     }
-    return { id, userId, project, sessionId, action, result, success, createdAt: new Date() };
+    return { id, userId, project, sessionId, action, result, success, createdAt: now };
+  }
+
+  /** A success resolves earlier dead ends for the same command or workflow. */
+  private async resolveDeadEnds(userId: string, project: string, action: string, result: string | undefined, now: Date) {
+    const key = fixKey(action);
+    if (!key) return;
+    const rows = await this.sql<{ id: string; content: string; metadata: DeadEndMeta | null; created_at: Date }[]>`
+      SELECT id, content, metadata, created_at FROM memories
+      WHERE user_id = ${userId} AND project = ${project}
+        AND content LIKE '[dead end]%'
+        AND (metadata->'resolved') IS NULL
+        AND created_at > NOW() - INTERVAL '30 days'
+    `;
+    for (const row of rows) {
+      const meta: DeadEndMeta = row.metadata ?? {};
+      if ((meta.key ?? fixKey(legacyAction(row.content))) !== key) continue;
+      const between = (await this.sql<{ action: string }[]>`
+        SELECT action FROM attempts
+        WHERE user_id = ${userId} AND project = ${project} AND success = TRUE
+          AND created_at > ${row.created_at} AND created_at < ${now}
+        ORDER BY created_at ASC
+      `).map(r => r.action);
+      meta.resolved = { at: now.toISOString(), fix: describeFix(key, action, result, between), via: action };
+      await this.sql`UPDATE memories SET metadata = ${this.sql.json(meta as never)} WHERE id = ${row.id}`;
+    }
   }
 
   async startSession(userId: string, project: string, task?: string): Promise<Session> {
@@ -207,8 +240,17 @@ export class PgStore implements JinamemStore {
       SELECT content FROM memories
       WHERE user_id = ${userId} AND project = ${project}
         AND content LIKE '[dead end]%'
+        AND (metadata->'resolved') IS NULL
         AND created_at > NOW() - INTERVAL '30 days'
       ORDER BY created_at DESC LIMIT 10
+    `;
+
+    const fixedRows = await this.sql<{ content: string; metadata: DeadEndMeta }[]>`
+      SELECT content, metadata FROM memories
+      WHERE user_id = ${userId} AND project = ${project}
+        AND content LIKE '[dead end]%'
+        AND (metadata->'resolved'->>'at')::timestamptz > NOW() - make_interval(days => ${FIXED_VISIBLE_DAYS})
+      ORDER BY (metadata->'resolved'->>'at') DESC LIMIT 5
     `;
 
     const taskRows = await this.sql<{ content: string }[]>`
@@ -220,8 +262,9 @@ export class PgStore implements JinamemStore {
 
     const pinnedFacts = pinnedRows.map(r => r.content);
     const deadEnds = deadEndRows.map(r => r.content.replace("[dead end] ", ""));
+    const fixed = fixedRows.map(r => formatFixed(r.content, r.metadata.resolved!.fix));
     const openTasks = taskRows.map(r => r.content);
-    const totalChars = [...pinnedFacts, ...deadEnds, ...openTasks].join(" ").length;
+    const totalChars = [...pinnedFacts, ...deadEnds, ...fixed, ...openTasks].join(" ").length;
 
     return {
       lastSession: lastSession ? {
@@ -231,6 +274,7 @@ export class PgStore implements JinamemStore {
       } : undefined,
       pinnedFacts,
       deadEnds,
+      fixed,
       openTasks,
       tokenEstimate: Math.round(totalChars / 4),
     };

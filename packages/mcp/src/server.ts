@@ -119,6 +119,11 @@ server.resource(
       briefing.deadEnds.forEach(d => lines.push(`• ${d}`));
     }
 
+    if (briefing.fixed?.length) {
+      lines.push("", "## ✅ Fixed recently — what worked");
+      briefing.fixed.forEach(f => lines.push(`• ${f}`));
+    }
+
     if (briefing.openTasks.length > 0) {
       lines.push("", "## 🔧 Open tasks from last session");
       briefing.openTasks.forEach(t => lines.push(`• ${t}`));
@@ -127,6 +132,7 @@ server.resource(
     if (
       briefing.pinnedFacts.length === 0 &&
       briefing.deadEnds.length === 0 &&
+      !briefing.fixed?.length &&
       briefing.openTasks.length === 0 &&
       !briefing.lastSession
     ) {
@@ -290,6 +296,11 @@ server.tool(
     if (briefing.deadEnds.length > 0) {
       lines.push(`\n## 🚫 Don't retry`);
       briefing.deadEnds.forEach(d => lines.push(`• ${d}`));
+    }
+
+    if (briefing.fixed?.length) {
+      lines.push(`\n## ✅ Fixed`);
+      briefing.fixed.forEach(f => lines.push(`• ${f}`));
     }
 
     if (briefing.openTasks.length > 0) {
